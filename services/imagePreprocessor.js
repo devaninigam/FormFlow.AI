@@ -183,7 +183,7 @@ class ImagePreprocessor {
       const pxW = Math.min(pageWidth - pxX, Math.ceil(b.width * pageWidth));
       const pxH = Math.min(pageHeight - pxY, Math.ceil(b.height * pageHeight));
 
-      if (pxW <= 2 || pxH <= 2) continue;
+      if (pxW <= 6 || pxH <= 6) continue;
 
       // 1. Determine local background paper color by sampling pixels around edges
       let bgR = 0, bgG = 0, bgB = 0, bgCount = 0;

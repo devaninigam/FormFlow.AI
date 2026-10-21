@@ -54,7 +54,7 @@ class AccidentTemplateFiller {
     const vAdult = getVal(/responsible adult/i, '');
     const vContact = getVal(/contact number|phone/i, '');
     const vSession = getVal(/session/i, '');
-    const vIncDate = getVal(/^incident date$/i, getVal(/incident date/i, vFormDate));
+    const vIncDate = getVal(/^incident date$/i, getVal(/incident date/i, ''));
     const vIncTime = getVal(/incident time|^time$/i, '');
     const vLocation = getVal(/space|location|room/i, '');
     const vNarrative = getVal(/narrative|description|details of what happened/i, '');
@@ -430,9 +430,9 @@ class AccidentTemplateFiller {
     setCheck('NEAR MISS', isChecked(/incident type:\s*near miss|near miss/i));
 
     // Severity
-    setCheck('RIDDOR', isChecked(/severity.*riddor|^severity riddor/i));
-    setCheck('MODERATE', isChecked(/severity.*moderate|severity riddor.*moderate/i) || /moderate/i.test(getVal(/severity/i, '')));
-    setCheck('MINOR', isChecked(/severity.*minor/i));
+    setCheck('RIDDOR', isChecked(/severity:\s*riddor|^severity riddor/i));
+    setCheck('MODERATE', isChecked(/severity:\s*moderate|severity riddor.*moderate/i));
+    setCheck('MINOR', isChecked(/severity:\s*minor/i));
 
     // RIDDOR details
     setCheck('DANGEROUS OCCURRENCE', isChecked(/dangerous occurrence/i));

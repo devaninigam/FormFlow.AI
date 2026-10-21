@@ -121,7 +121,7 @@ class ExcelExporter {
       // 1. ABOUT THIS FORM & IT'S COMPLETION
       addSectionBanner("ABOUT THIS FORM & IT'S COMPLETION");
       setFieldPair('B', 'C', 'Ref No', findVal(/ref no|reference/i));
-      setFieldPair('D', 'E', 'DATE', findVal(/^form date|incident date/i));
+      setFieldPair('D', 'E', 'DATE', findVal(/^form date$/i) || findVal(/form date/i));
       setFieldPair('F', 'G', 'PROJECT NAME', findVal(/project name|project/i));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
@@ -215,7 +215,7 @@ class ExcelExporter {
 
       // 3. ABOUT THE INCIDENT
       addSectionBanner('ABOUT THE INCIDENT');
-      setFieldPair('B', 'C', 'DATE', findVal(/^incident date|date/i));
+      setFieldPair('B', 'C', 'DATE', findVal(/^incident date$/i) || findVal(/incident date/i));
       setFieldPair('D', 'E', 'TIME', findVal(/incident time|time/i));
       setFieldPair('F', 'G', 'SPACE', findVal(/space|location/i));
       formSheet.getRow(currentRow).height = 22;
@@ -236,7 +236,7 @@ class ExcelExporter {
       formSheet.getCell(`B${currentRow}`).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
       formSheet.getCell(`B${currentRow}`).border = thinBorder;
       setCbCell('C', 'D', 'RIDDOR', isChecked(/severity:\s*riddor/i));
-      setCbCell('E', 'E', 'MODERATE', isChecked(/severity:\s*moderate/i) || !isChecked(/severity:\s*riddor|minor/i));
+      setCbCell('E', 'E', 'MODERATE', isChecked(/severity:\s*moderate/i));
       setCbCell('F', 'G', 'MINOR', isChecked(/severity:\s*minor/i));
       formSheet.getRow(currentRow).height = 22;
       currentRow += 2;
