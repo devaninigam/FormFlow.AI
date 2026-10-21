@@ -1,0 +1,39 @@
+{
+  "name": "formflow-ai",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "server": "node server.js",
+    "client": "vite",
+    "dev": "concurrently -n \"API,VITE\" -c \"cyan,magenta\" \"node server.js\" \"vite\"",
+    "build": "vite build",
+    "test": "node tests/verify_all_forms.js",
+    "generate-samples": "node -e \"require('./services/sampleGenerator').generateAllSamples()\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.11",
+    "cors": "^2.8.6",
+    "docx": "^9.13.0",
+    "dotenv": "^18.0.8",
+    "exceljs": "^4.4.0",
+    "express": "^5.3.0",
+    "lucide-react": "^1.60.0",
+    "multer": "^2.4.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.4.299",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "sharp": "^0.35.5",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "vite": "^8.3.4"
+  }
+}
