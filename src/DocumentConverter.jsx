@@ -1197,7 +1197,7 @@ export default function DocumentConverter() {
               <Sparkles size={18} color="#ffffff" />
             </div>
             <div>
-              <div className="brand-title">FormFlow AI</div>
+              <div className="brand-title">FormFlow</div>
             </div>
             <span className="brand-badge">Dynamic OCR</span>
           </div>
@@ -2303,103 +2303,103 @@ export default function DocumentConverter() {
             <div className="word-doc-canvas">
               <ModalErrorBoundary onDownloadFallback={downloadWordDocx}>
                 <div className="word-doc-sheet" style={{ background: '#ffffff', color: '#0f172a' }}>
-                {isAccidentDocument(doc) ? (
-                  <>
-                    <div className="word-doc-title" style={{ color: '#1e3a5f' }}>
-                      Accident & Incident Report Form
-                    </div>
-                    <div className="word-doc-divider" />
-                    <div className="word-doc-subtitle" style={{ color: '#64748b' }}>
-                      FILLED FROM MASTER TEMPLATE LAYOUT • SOURCE: {doc.filename} • {new Date().toLocaleDateString()}
-                    </div>
-                    {/* Horizontal multi-column form — same layout as Accident Report Template.docx */}
-                    {renderAuthenticFormLayout(doc, false)}
-                  </>
-                ) : (
-                  <>
-                    <div className="word-doc-title">
-                      {getDisplayDocTitle(doc)}
-                    </div>
-                    <div className="word-doc-divider" />
-                    <div className="word-doc-subtitle">
-                      FORMFLOW AI VERIFIED DOCUMENT RECONSTRUCTION &bull; EXPORTED: {new Date().toLocaleDateString()}
-                    </div>
+                  {isAccidentDocument(doc) ? (
+                    <>
+                      <div className="word-doc-title" style={{ color: '#1e3a5f' }}>
+                        Accident & Incident Report Form
+                      </div>
+                      <div className="word-doc-divider" />
+                      <div className="word-doc-subtitle" style={{ color: '#64748b' }}>
+                        FILLED FROM MASTER TEMPLATE LAYOUT • SOURCE: {doc.filename} • {new Date().toLocaleDateString()}
+                      </div>
+                      {/* Horizontal multi-column form — same layout as Accident Report Template.docx */}
+                      {renderAuthenticFormLayout(doc, false)}
+                    </>
+                  ) : (
+                    <>
+                      <div className="word-doc-title">
+                        {getDisplayDocTitle(doc)}
+                      </div>
+                      <div className="word-doc-divider" />
+                      <div className="word-doc-subtitle">
+                        FORMFLOW AI VERIFIED DOCUMENT RECONSTRUCTION &bull; EXPORTED: {new Date().toLocaleDateString()}
+                      </div>
 
-                    <div className="word-meta-strip">
-                      <div className="word-meta-item">
-                        <span className="word-meta-label">Reference ID</span>
-                        <span className="word-meta-val">
-                          {doc.fields?.find(f => /ref no|reference/i.test(f.label))?.value || '—'}
-                        </span>
-                      </div>
-                      <div className="word-meta-item">
-                        <span className="word-meta-label">Form Date</span>
-                        <span className="word-meta-val">
-                          {doc.fields?.find(f => /form date|incident date|date/i.test(f.label))?.value || '—'}
-                        </span>
-                      </div>
-                      <div className="word-meta-item">
-                        <span className="word-meta-label">Project / Facility</span>
-                        <span className="word-meta-val">
-                          {doc.fields?.find(f => /project name|project/i.test(f.label))?.value || '—'}
-                        </span>
-                      </div>
-                      <div className="word-meta-item">
-                        <span className="word-meta-label">Status</span>
-                        <span className="word-meta-val" style={{ color: '#16a34a' }}>
-                          Official Record
-                        </span>
-                      </div>
-                    </div>
-
-                    {renderAuthenticFormLayout(doc, false)}
-
-                    {(doc.tables || []).length > 0 && (
-                      <div style={{ marginTop: '22px' }}>
-                        <div className="word-section-banner">
-                          Detected Tables & Options Matrix
+                      <div className="word-meta-strip">
+                        <div className="word-meta-item">
+                          <span className="word-meta-label">Reference ID</span>
+                          <span className="word-meta-val">
+                            {doc.fields?.find(f => /ref no|reference/i.test(f.label))?.value || '—'}
+                          </span>
                         </div>
-                        {doc.tables.map((tbl, tIdx) => (
-                          <div key={tbl.id || tIdx} style={{ marginBottom: '16px' }}>
-                            <div style={{ fontWeight: 700, fontSize: '0.84rem', color: '#334155', marginBottom: '6px' }}>
-                              {tbl.title || `Table ${tIdx + 1}`}
-                            </div>
-                            <table className="word-form-table">
-                              <thead>
-                                <tr style={{ background: '#1e293b' }}>
-                                  {(tbl.headers || []).map((h, hIdx) => (
-                                    <th key={hIdx} style={{ padding: '7px 12px', color: '#ffffff', fontSize: '0.78rem', fontWeight: 700, textAlign: 'left', border: '1px solid #334155' }}>
-                                      {h}
-                                    </th>
-                                  ))}
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {(tbl.rows || []).map((row, rIdx) => (
-                                  <tr key={rIdx} style={{ background: rIdx % 2 === 1 ? '#f8fafc' : '#ffffff' }}>
-                                    {row.map((cell, cIdx) => (
-                                      <td key={cIdx} style={{ padding: '7px 12px', fontSize: '0.82rem', border: '1px solid #e2e8f0', color: '#1e293b' }}>
-                                        {cell || '-'}
-                                      </td>
+                        <div className="word-meta-item">
+                          <span className="word-meta-label">Form Date</span>
+                          <span className="word-meta-val">
+                            {doc.fields?.find(f => /form date|incident date|date/i.test(f.label))?.value || '—'}
+                          </span>
+                        </div>
+                        <div className="word-meta-item">
+                          <span className="word-meta-label">Project / Facility</span>
+                          <span className="word-meta-val">
+                            {doc.fields?.find(f => /project name|project/i.test(f.label))?.value || '—'}
+                          </span>
+                        </div>
+                        <div className="word-meta-item">
+                          <span className="word-meta-label">Status</span>
+                          <span className="word-meta-val" style={{ color: '#16a34a' }}>
+                            Official Record
+                          </span>
+                        </div>
+                      </div>
+
+                      {renderAuthenticFormLayout(doc, false)}
+
+                      {(doc.tables || []).length > 0 && (
+                        <div style={{ marginTop: '22px' }}>
+                          <div className="word-section-banner">
+                            Detected Tables & Options Matrix
+                          </div>
+                          {doc.tables.map((tbl, tIdx) => (
+                            <div key={tbl.id || tIdx} style={{ marginBottom: '16px' }}>
+                              <div style={{ fontWeight: 700, fontSize: '0.84rem', color: '#334155', marginBottom: '6px' }}>
+                                {tbl.title || `Table ${tIdx + 1}`}
+                              </div>
+                              <table className="word-form-table">
+                                <thead>
+                                  <tr style={{ background: '#1e293b' }}>
+                                    {(tbl.headers || []).map((h, hIdx) => (
+                                      <th key={hIdx} style={{ padding: '7px 12px', color: '#ffffff', fontSize: '0.78rem', fontWeight: 700, textAlign: 'left', border: '1px solid #334155' }}>
+                                        {h}
+                                      </th>
                                     ))}
                                   </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </>
-                )}
+                                </thead>
+                                <tbody>
+                                  {(tbl.rows || []).map((row, rIdx) => (
+                                    <tr key={rIdx} style={{ background: rIdx % 2 === 1 ? '#f8fafc' : '#ffffff' }}>
+                                      {row.map((cell, cIdx) => (
+                                        <td key={cIdx} style={{ padding: '7px 12px', fontSize: '0.82rem', border: '1px solid #e2e8f0', color: '#1e293b' }}>
+                                          {cell || '-'}
+                                        </td>
+                                      ))}
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
 
-                <div className="word-doc-footer">
-                  <span>Page 1 of 1 &bull; FormFlow AI Document Verification Engine</span>
-                  <span>Confidential Business Document &bull; OpenXML Specification</span>
+                  <div className="word-doc-footer">
+                    <span>Page 1 of 1 &bull; FormFlow AI Document Verification Engine</span>
+                    <span>Confidential Business Document &bull; OpenXML Specification</span>
+                  </div>
                 </div>
-              </div>
-            </ModalErrorBoundary>
-          </div>
+              </ModalErrorBoundary>
+            </div>
 
             {/* 5. Microsoft Word Bottom Status Bar */}
             <div className="word-statusbar">
