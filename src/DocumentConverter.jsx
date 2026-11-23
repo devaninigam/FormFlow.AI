@@ -1360,27 +1360,67 @@ export default function DocumentConverter() {
         </div>
       </header>
 
-      {/* ---------------- Quick Test Samples Bar ---------------- */}
+      {/* ---------------- Document Controls Bar ---------------- */}
       <div className="sample-bar">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
           <Layers size={13} color="var(--primary)" />
-          <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Quick Samples:</span>
+          <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>
+            {doc ? (doc.filename || 'Document View') : 'Document Intelligence'}
+          </span>
+          {doc && (
+            <span style={{ fontSize: '0.72rem', color: '#64748b', marginLeft: '4px' }}>
+              • {doc.pageCount || 1} {doc.pageCount === 1 ? 'Page' : 'Pages'}
+            </span>
+          )}
         </div>
-        <div className="sample-buttons">
-          <button className="sample-btn" onClick={() => loadSample('medical_intake')}>
-            <span>🏥</span> Medical Intake
+
+        {/* View & Zoom Controls embedded directly in toolbar row for unobstructed document view */}
+        <div className="sample-bar-view-controls">
+          <button
+            className="floating-ctrl-btn"
+            onClick={handleZoomOut}
+            title="Zoom Out (-)"
+          >
+            <ZoomOut size={13} />
           </button>
-          <button className="sample-btn" onClick={() => loadSample('equipment_inspection')}>
-            <span>⚙️</span> Equipment Log (Table)
+          <span
+            className="floating-ctrl-zoom-text"
+            onClick={handleFitWidth}
+            title="Click to reset to Fit Width"
+          >
+            {viewMode === 'fit-width' ? 'Fit W' : (viewMode === 'fit-page' ? 'Fit Page' : `${Math.round(zoomLevel * 100)}%`)}
+          </span>
+          <button
+            className="floating-ctrl-btn"
+            onClick={handleZoomIn}
+            title="Zoom In (+)"
+          >
+            <ZoomIn size={13} />
           </button>
-          <button className="sample-btn" onClick={() => loadSample('tax_photocopy')}>
-            <span>📄</span> W-2C Tax Photocopy
+          <div className="floating-ctrl-divider" />
+          <button
+            className={`floating-ctrl-btn ${viewMode === 'fit-width' ? 'active' : ''}`}
+            onClick={handleFitWidth}
+            title="Fit Document to Width (Recommended for Reading)"
+          >
+            <Minimize2 size={13} style={{ transform: 'rotate(90deg)' }} />
+            <span>Fit Width</span>
           </button>
-          <button className="sample-btn" onClick={() => loadSample('multipage_contract')}>
-            <span>📑</span> Multi-Page PDF
+          <button
+            className={`floating-ctrl-btn ${viewMode === 'fit-page' ? 'active' : ''}`}
+            onClick={handleFitPage}
+            title="Fit Entire Document Page"
+          >
+            <Maximize2 size={13} />
+            <span>Fit Page</span>
           </button>
-          <button className="sample-btn" onClick={() => loadSample('accident_report')} style={{ borderColor: 'rgba(244, 63, 94, 0.4)', background: 'rgba(244, 63, 94, 0.08)' }}>
-            <span>🚨</span> Accident & Incident Report
+          <div className="floating-ctrl-divider" />
+          <button
+            className="floating-ctrl-btn"
+            onClick={() => setRotation(r => (r + 90) % 360)}
+            title="Rotate Clockwise 90°"
+          >
+            <RotateCw size={13} />
           </button>
         </div>
       </div>
@@ -1566,56 +1606,6 @@ export default function DocumentConverter() {
               onMouseUp={handleCanvasMouseUp}
               style={{ cursor: isDrawMode ? 'crosshair' : (viewMode === 'custom' && zoomLevel > 1.0 ? 'grab' : 'default') }}
             >
-              {/* Floating Quick Action Controls Bar */}
-              <div className="canvas-floating-controls">
-                <button
-                  className="floating-ctrl-btn"
-                  onClick={handleZoomOut}
-                  title="Zoom Out (-)"
-                >
-                  <ZoomOut size={14} />
-                </button>
-                <span
-                  className="floating-ctrl-zoom-text"
-                  onClick={handleFitWidth}
-                  title="Click to reset to Fit Width"
-                >
-                  {viewMode === 'fit-width' ? 'Fit W' : (viewMode === 'fit-page' ? 'Fit Page' : `${Math.round(zoomLevel * 100)}%`)}
-                </span>
-                <button
-                  className="floating-ctrl-btn"
-                  onClick={handleZoomIn}
-                  title="Zoom In (+)"
-                >
-                  <ZoomIn size={14} />
-                </button>
-                <div className="floating-ctrl-divider" />
-                <button
-                  className={`floating-ctrl-btn ${viewMode === 'fit-width' ? 'active' : ''}`}
-                  onClick={handleFitWidth}
-                  title="Fit Document to Width (Recommended for Reading)"
-                >
-                  <Minimize2 size={13} style={{ transform: 'rotate(90deg)' }} />
-                  <span>Fit Width</span>
-                </button>
-                <button
-                  className={`floating-ctrl-btn ${viewMode === 'fit-page' ? 'active' : ''}`}
-                  onClick={handleFitPage}
-                  title="Fit Entire Document Page"
-                >
-                  <Maximize2 size={13} />
-                  <span>Fit Page</span>
-                </button>
-                <div className="floating-ctrl-divider" />
-                <button
-                  className="floating-ctrl-btn"
-                  onClick={() => setRotation(r => (r + 90) % 360)}
-                  title="Rotate Clockwise 90°"
-                >
-                  <RotateCw size={13} />
-                </button>
-              </div>
-
               {canvasViewType === 'split' ? (
                 /* Split Side-by-Side View */
                 <div className="split-canvas-container" style={{ padding: '16px', maxWidth: '1400px' }}>

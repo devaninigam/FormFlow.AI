@@ -40,10 +40,12 @@
   padding: 0;
 }
 
-html, body {
+html,
+body {
   height: 100%;
   width: 100%;
-  overflow: hidden; /* Prevent window-level scrollbars */
+  overflow: hidden;
+  /* Prevent window-level scrollbars */
 }
 
 body {
@@ -59,19 +61,26 @@ body {
   width: 6px;
   height: 6px;
 }
+
 ::-webkit-scrollbar-track {
   background: var(--bg-surface);
 }
+
 ::-webkit-scrollbar-thumb {
   background: #252f46;
   border-radius: 4px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: #3b4763;
 }
 
 /* Typography Helpers */
-h1, h2, h3, h4, h5 {
+h1,
+h2,
+h3,
+h4,
+h5 {
   font-weight: 700;
   color: var(--text-main);
   letter-spacing: -0.02em;
@@ -179,6 +188,30 @@ h1, h2, h3, h4, h5 {
   font-size: 0.8rem;
 }
 
+.sample-bar-view-controls {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  padding: 2px 6px;
+  border-radius: 20px;
+  gap: 3px;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.sample-bar-view-controls .floating-ctrl-btn {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 12px;
+  font-size: 0.72rem;
+}
+
+.sample-bar-view-controls .floating-ctrl-zoom-text {
+  font-size: 0.72rem;
+  min-width: 42px;
+}
+
 .sample-buttons {
   display: flex;
   gap: 6px;
@@ -230,7 +263,8 @@ h1, h2, h3, h4, h5 {
   position: relative;
 }
 
-.dropzone-box:hover, .dropzone-box.drag-over {
+.dropzone-box:hover,
+.dropzone-box.drag-over {
   border-color: var(--primary);
   box-shadow: 0 0 35px var(--primary-glow);
   transform: scale(1.005);
@@ -251,7 +285,8 @@ h1, h2, h3, h4, h5 {
 /* Main Split View Layout */
 .workspace-grid {
   flex: 1;
-  min-height: 0; /* CRITICAL for flex item scrolling */
+  min-height: 0;
+  /* CRITICAL for flex item scrolling */
   display: grid;
   grid-template-columns: 52% 48%;
   overflow: hidden;
@@ -458,23 +493,7 @@ h1, h2, h3, h4, h5 {
 
 /* Floating Quick Action Controls Bar */
 .canvas-floating-controls {
-  position: absolute;
-  bottom: 20px;
-  left: 50%;
-  transform: translateX(-50%);
-  display: flex;
-  align-items: center;
-  background: rgba(15, 23, 42, 0.88);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
-  padding: 4px 8px;
-  border-radius: 30px;
-  gap: 4px;
-  z-index: 25;
-  user-select: none;
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  display: none !important;
 }
 
 .canvas-floating-controls:hover {
@@ -551,10 +570,12 @@ h1, h2, h3, h4, h5 {
   border-color: rgba(16, 185, 129, 0.7);
   background: rgba(16, 185, 129, 0.08);
 }
+
 .bbox-box.conf-review {
   border-color: rgba(245, 158, 11, 0.85);
   background: rgba(245, 158, 11, 0.15);
 }
+
 .bbox-box.conf-low {
   border-color: rgba(244, 63, 94, 0.85);
   background: rgba(244, 63, 94, 0.18);
@@ -568,16 +589,28 @@ h1, h2, h3, h4, h5 {
 }
 
 @keyframes bboxPulseAnimation {
-  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.8); }
-  50% { transform: scale(1.02); box-shadow: 0 0 0 6px rgba(56, 189, 248, 0.4); }
-  100% { transform: scale(1); box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2); }
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.8);
+  }
+
+  50% {
+    transform: scale(1.02);
+    box-shadow: 0 0 0 6px rgba(56, 189, 248, 0.4);
+  }
+
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+  }
 }
 
 .bbox-pulse {
   animation: bboxPulseAnimation 0.8s ease-out;
 }
 
-.bbox-box:hover, .bbox-box.selected {
+.bbox-box:hover,
+.bbox-box.selected {
   border-color: #6366f1 !important;
   background: rgba(99, 102, 241, 0.28) !important;
   box-shadow: 0 0 14px rgba(99, 102, 241, 0.7);
@@ -748,10 +781,12 @@ h1, h2, h3, h4, h5 {
   background: var(--emerald-bg);
   color: var(--accent-emerald);
 }
+
 .confidence-pill.review {
   background: var(--amber-bg);
   color: var(--accent-amber);
 }
+
 .confidence-pill.low {
   background: var(--rose-bg);
   color: var(--accent-rose);
@@ -958,7 +993,8 @@ h1, h2, h3, h4, h5 {
   font-size: 0.8rem;
 }
 
-.dynamic-table-grid th, .dynamic-table-grid td {
+.dynamic-table-grid th,
+.dynamic-table-grid td {
   border: 1px solid rgba(255, 255, 255, 0.08);
   padding: 6px 8px;
 }

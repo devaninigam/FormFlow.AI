@@ -67,12 +67,17 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection:', reason);
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`====================================================`);
   console.log(`  FormFlow AI Server running on http://localhost:${PORT}`);
   console.log(`  API Endpoint: http://localhost:${PORT}/api/document-convert`);
   console.log(`====================================================`);
 });
+
+// Configure server timeouts for long OCR jobs (prevents premature 502 connection resets)
+server.timeout = 300000;         // 5 minutes
+server.keepAliveTimeout = 120000; // 2 minutes
+server.headersTimeout = 125000;   // slightly greater than keepAliveTimeout
 
 module.exports = app;
 
