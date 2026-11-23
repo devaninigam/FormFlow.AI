@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Upload, FileText, CheckCircle2, AlertTriangle, AlertCircle, RefreshCw,
-  ZoomIn, ZoomOut, RotateCw, Maximize2, Download, Table as TableIcon,
+  ZoomIn, ZoomOut, RotateCw, Maximize2, Minimize2, Download, Table as TableIcon,
   FileSpreadsheet, FileCode, Check, Eye, Trash2, Plus,
   Layers, ChevronLeft, ChevronRight, HelpCircle, ShieldCheck, Sparkles, X,
-  ArrowLeft, Search
+  ArrowLeft, Search, Columns
 } from 'lucide-react';
 
 const API_BASE = '/api/document-convert';
@@ -44,15 +44,104 @@ class ModalErrorBoundary extends React.Component {
   }
 }
 
+/**
+ * Safe JSON response parser that prevents "Unexpected end of JSON input"
+ * when a reverse proxy, network error, or empty body is returned.
+ */
+async function parseResponseJson(res, defaultMsg = 'Operation failed') {
+  const text = await res.text();
+  if (!text || text.trim() === '') {
+    if (!res.ok) {
+      if (res.status === 504 || res.status === 502) {
+        throw new Error(`Server request timed out (${res.status} Gateway). Please try again in a moment.`);
+      }
+      throw new Error(`Server returned error (${res.status}${res.statusText ? ': ' + res.statusText : ''}).`);
+    }
+    return {};
+  }
+  try {
+    const data = JSON.parse(text);
+    if (!res.ok) {
+      throw new Error(data.error || data.message || `${defaultMsg} (${res.status})`);
+    }
+    return data;
+  } catch (err) {
+    if (!res.ok) {
+      if (res.status === 504 || res.status === 502) {
+        throw new Error(`Server request timed out (${res.status} Gateway). Please try again in a moment.`);
+      }
+      throw new Error(text.length < 150 ? text : `${defaultMsg} (${res.status} ${res.statusText || 'Error'})`);
+    }
+    throw new Error(`Failed to parse response: ${err.message}`);
+  }
+}
+
+/**
+ * Client-side image normalizer for huge camera photos (12MP-48MP from phones).
+ * Scales down to max 2200px before uploading to eliminate server memory spikes.
+ */
+function optimizeImageClientSide(file) {
+  return new Promise((resolve) => {
+    if (!file || !file.type || !file.type.startsWith('image/') || file.type.includes('gif') || file.type.includes('svg')) {
+      return resolve(file);
+    }
+    if (file.size < 1.5 * 1024 * 1024) {
+      return resolve(file);
+    }
+
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const origW = img.naturalWidth || img.width;
+      const origH = img.naturalHeight || img.height;
+      const maxDim = 2200;
+
+      if (Math.max(origW, origH) <= maxDim && file.size < 3 * 1024 * 1024) {
+        return resolve(file);
+      }
+
+      let w = origW;
+      let h = origH;
+      if (Math.max(origW, origH) > maxDim) {
+        const scale = maxDim / Math.max(origW, origH);
+        w = Math.round(origW * scale);
+        h = Math.round(origH * scale);
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+
+      canvas.toBlob((blob) => {
+        if (!blob || blob.size >= file.size) {
+          return resolve(file);
+        }
+        const optimizedFile = new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), {
+          type: 'image/jpeg',
+          lastModified: Date.now()
+        });
+        resolve(optimizedFile);
+      }, 'image/jpeg', 0.92);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(file);
+    };
+    img.src = url;
+  });
+}
+
 export default function DocumentConverter() {
-  /** Detect Accident & Incident Report forms (Example 1/2 PDFs, etc.) */
+  /** Early Years Accident = main FormFlow layout (values filled from upload labels). */
   const isAccidentDocument = (currentDoc) => {
     if (!currentDoc) return false;
-    const title = `${currentDoc.documentTitle || ''} ${currentDoc.filename || ''}`.toLowerCase();
-    if (/accident|incident|injury|riddor|example\s*[12]/i.test(title)) return true;
-    return (currentDoc.fields || []).some(f =>
-      /riddor|injury|incident|ey staff|daycare|toybox|cause:/i.test(f.label || '')
-    );
+    if (currentDoc.formLayout === 'early_years_accident') return true;
+    if (currentDoc.formLayout === 'dynamic') return false;
+    const labels = (currentDoc.fields || []).map(f => f.label || '').join(' ');
+    return /riddor|ey staff|toybox|surestart|name of the person involved/i.test(labels);
   };
 
   const getDisplayDocTitle = (currentDoc) => {
@@ -67,9 +156,6 @@ export default function DocumentConverter() {
       .replace(/\.[^/.]+$/, '')
       .replace(/_/g, ' ')
       .trim();
-    if (isAccidentDocument(currentDoc)) {
-      return 'ACCIDENT & INCIDENT REPORT FORM';
-    }
     return cleanName.toUpperCase();
   };
 
@@ -92,7 +178,7 @@ export default function DocumentConverter() {
   };
 
   // Canvas / Preview state
-  const [viewMode, setViewMode] = useState('fit'); // 'fit' or 'custom'
+  const [viewMode, setViewMode] = useState('fit-width'); // 'fit-width' | 'fit-page' | 'custom'
   const [zoomLevel, setZoomLevel] = useState(1.0);
   const [rotation, setRotation] = useState(0);
   const [canvasViewType, setCanvasViewType] = useState('reconstructed'); // 'reconstructed' | 'original' | 'split'
@@ -670,7 +756,7 @@ export default function DocumentConverter() {
     setDoc(null);
     setSelectedFieldId(null);
     setCurrentPage(1);
-    setViewMode('fit');
+    setViewMode('fit-width');
     setZoomLevel(1.0);
     setPanPos({ x: 0, y: 0 });
     setErrorMsg(null);
@@ -683,27 +769,34 @@ export default function DocumentConverter() {
     if (!file) return;
     setErrorMsg(null);
     setIsUploading(true);
-    setUploadProgress('Uploading document...');
+    setUploadProgress('Preparing document...');
 
     try {
+      let fileToUpload = file;
+      if (file.type && file.type.startsWith('image/') && !file.type.includes('gif')) {
+        setUploadProgress('Optimizing image for fast analysis...');
+        try {
+          fileToUpload = await optimizeImageClientSide(file);
+        } catch (scaleErr) {
+          console.warn('Client image optimization fallback:', scaleErr);
+          fileToUpload = file;
+        }
+      }
+
+      setUploadProgress('Uploading document...');
       const formData = new FormData();
-      formData.append('document', file);
+      formData.append('document', fileToUpload);
 
       const res = await fetch(`${API_BASE}/upload`, {
         method: 'POST',
         body: formData
       });
 
-      if (!res.ok) {
-        const errJson = await res.json();
-        throw new Error(errJson.error || 'Failed to upload document');
-      }
-
-      const data = await res.json();
+      const data = await parseResponseJson(res, 'Failed to upload document');
       const uploadedDoc = data.document;
       setDoc(uploadedDoc);
       setCurrentPage(1);
-      setViewMode('fit');
+      setViewMode('fit-width');
       setZoomLevel(1.0);
       setRotation(0);
       setPanPos({ x: 0, y: 0 });
@@ -735,12 +828,7 @@ export default function DocumentConverter() {
         body: JSON.stringify({ provider: engine })
       });
 
-      if (!res.ok) {
-        const errJson = await res.json();
-        throw new Error(errJson.error || 'Document analysis failed');
-      }
-
-      const data = await res.json();
+      const data = await parseResponseJson(res, 'Document analysis failed');
       setDoc(data.document);
       setCanvasViewType('reconstructed');
       setPreviewTimestamp(Date.now());
@@ -763,14 +851,10 @@ export default function DocumentConverter() {
 
     try {
       const res = await fetch(`${API_BASE}/load-sample/${sampleId}`, { method: 'POST' });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || 'Failed to load sample');
-      }
-      const data = await res.json();
+      const data = await parseResponseJson(res, 'Failed to load sample');
       setDoc(data.document);
       setCurrentPage(1);
-      setViewMode('fit');
+      setViewMode('fit-width');
       setZoomLevel(1.0);
       setRotation(0);
       setPanPos({ x: 0, y: 0 });
@@ -810,7 +894,7 @@ export default function DocumentConverter() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fields, tables })
       });
-      const data = await res.json();
+      const data = await parseResponseJson(res, 'Failed to sync fields');
       if (data.summary) {
         setDoc(prev => ({ ...prev, summary: data.summary, status: data.status, extractedAt: data.extractedAt || prev.extractedAt }));
       }
@@ -980,6 +1064,18 @@ export default function DocumentConverter() {
     }, 50);
   };
 
+  const scrollToCanvasField = (fieldId) => {
+    setSelectedFieldId(fieldId);
+    setTimeout(() => {
+      const el = document.getElementById(`bbox-${fieldId}`) || document.getElementById(`bbox-split-${fieldId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+        el.classList.add('bbox-pulse');
+        setTimeout(() => el.classList.remove('bbox-pulse'), 1200);
+      }
+    }, 50);
+  };
+
   // Zoom helpers
   const handleZoomIn = () => {
     setViewMode('custom');
@@ -991,8 +1087,14 @@ export default function DocumentConverter() {
     setZoomLevel(z => Math.max(0.4, Number((z - 0.2).toFixed(1))));
   };
 
+  const handleFitWidth = () => {
+    setViewMode('fit-width');
+    setZoomLevel(1.0);
+    setPanPos({ x: 0, y: 0 });
+  };
+
   const handleFitPage = () => {
-    setViewMode('fit');
+    setViewMode('fit-page');
     setZoomLevel(1.0);
     setPanPos({ x: 0, y: 0 });
     setRotation(0);
@@ -1012,8 +1114,7 @@ export default function DocumentConverter() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fields: doc.fields, cleanupRegions: doc.cleanupRegions || [] })
       });
-      if (!res.ok) throw new Error('Failed to generate PDF preview');
-      const data = await res.json();
+      const data = await parseResponseJson(res, 'Failed to generate PDF preview');
       setPdfPreviewData(data);
     } catch (err) {
       console.error(err);
@@ -1119,7 +1220,7 @@ export default function DocumentConverter() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fields: doc.fields })
       });
-      const data = await res.json();
+      const data = await parseResponseJson(res, 'Failed to load JSON export');
       setRawJsonText(JSON.stringify(data, null, 2));
       setShowJsonModal(true);
     } catch (err) {
@@ -1199,7 +1300,9 @@ export default function DocumentConverter() {
             <div>
               <div className="brand-title">FormFlow</div>
             </div>
-            <span className="brand-badge">Dynamic OCR</span>
+            <span className="brand-badge">
+              {doc?.formLayout === 'early_years_accident' ? 'Early Years Form' : 'Dynamic OCR'}
+            </span>
           </div>
         </div>
 
@@ -1242,7 +1345,7 @@ export default function DocumentConverter() {
             ref={fileInputRef}
             onClick={(e) => { e.target.value = ''; }}
             onChange={(e) => handleFileUpload(e.target.files[0])}
-            accept=".pdf,.png,.jpg,.jpeg,.webp,.tiff"
+            accept="image/*,application/pdf,.pdf,.png,.jpg,.jpeg,.webp,.tiff,.tif,.bmp,.jfif,.gif"
             style={{ display: 'none' }}
           />
 
@@ -1351,7 +1454,7 @@ export default function DocumentConverter() {
               </button>
             </div>
             <div style={{ marginTop: '20px', fontSize: '0.74rem', color: 'var(--text-dim)' }}>
-              Supports PDF, PNG, JPG, JPEG, WEBP, TIFF (up to 30 MB)
+              Supports PDF, PNG, JPG, JPEG, WEBP, TIFF, BMP (up to 30 MB)
             </div>
           </div>
         </main>
@@ -1362,16 +1465,16 @@ export default function DocumentConverter() {
           <section className="preview-pane">
             <div className="preview-toolbar">
               {/* Page Navigator */}
-              <div className="toolbar-group">
+              <div className="toolbar-group page-nav-group">
                 <button
                   className="icon-btn"
                   onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
                   disabled={currentPage <= 1}
                   title="Previous Page"
                 >
-                  <ChevronLeft size={15} />
+                  <ChevronLeft size={16} />
                 </button>
-                <span style={{ fontWeight: 600, minWidth: '80px', textAlign: 'center' }}>
+                <span className="page-nav-indicator">
                   Page {currentPage} of {doc.pageCount || 1}
                 </span>
                 <button
@@ -1380,84 +1483,62 @@ export default function DocumentConverter() {
                   disabled={currentPage >= (doc.pageCount || 1)}
                   title="Next Page"
                 >
-                  <ChevronRight size={15} />
+                  <ChevronRight size={16} />
                 </button>
               </div>
 
-              {/* Zoom & View Controls */}
-              <div className="toolbar-group">
-                <button className="icon-btn" onClick={handleZoomOut} title="Zoom Out">
-                  <ZoomOut size={15} />
-                </button>
-                <span style={{ minWidth: '42px', textAlign: 'center', fontFamily: 'var(--font-mono)', fontSize: '0.74rem' }}>
-                  {viewMode === 'fit' ? 'FIT' : `${Math.round(zoomLevel * 100)}%`}
-                </span>
-                <button className="icon-btn" onClick={handleZoomIn} title="Zoom In">
-                  <ZoomIn size={15} />
+              {/* Document View Switcher */}
+              <div className="view-mode-pill-group">
+                <button
+                  className={`view-mode-pill ${canvasViewType === 'original' ? 'active' : ''}`}
+                  onClick={() => setCanvasViewType('original')}
+                  title="View Original Uploaded Scan with Overlays"
+                >
+                  <FileText size={14} />
+                  <span>Original Scan</span>
                 </button>
                 <button
-                  className={`icon-btn ${viewMode === 'fit' ? 'active' : ''}`}
+                  className={`view-mode-pill ${canvasViewType === 'reconstructed' ? 'active' : ''}`}
+                  onClick={() => setCanvasViewType('reconstructed')}
+                  title="View Reconstructed Form with Clean Digital Text"
+                >
+                  <Sparkles size={14} />
+                  <span>Reconstructed</span>
+                </button>
+                <button
+                  className={`view-mode-pill ${canvasViewType === 'split' ? 'active' : ''}`}
+                  onClick={() => setCanvasViewType('split')}
+                  title="Side-by-Side Comparison: Original vs Reconstructed"
+                >
+                  <Columns size={14} />
+                  <span>Side-by-Side</span>
+                </button>
+              </div>
+
+              {/* Quick View Controls & Tools */}
+              <div className="toolbar-group toolbar-tools-group">
+                <button
+                  className={`icon-btn ${viewMode === 'fit-width' ? 'active' : ''}`}
+                  onClick={handleFitWidth}
+                  title="Fit to Width (Clear & Large Form Reading)"
+                >
+                  <Minimize2 size={15} style={{ transform: 'rotate(90deg)' }} />
+                </button>
+                <button
+                  className={`icon-btn ${viewMode === 'fit-page' ? 'active' : ''}`}
                   onClick={handleFitPage}
                   title="Fit Entire Page in View"
                 >
                   <Maximize2 size={15} />
                 </button>
-                <button className="icon-btn" onClick={() => setRotation(r => (r + 90) % 360)} title="Rotate 90°">
+                <button
+                  className="icon-btn"
+                  onClick={() => setRotation(r => (r + 90) % 360)}
+                  title="Rotate 90° Clockwise"
+                >
                   <RotateCw size={15} />
                 </button>
-              </div>
-
-              {/* Document View Switcher */}
-              <div className="toolbar-group" style={{ background: 'rgba(0,0,0,0.3)', padding: '2px 4px', borderRadius: '6px', gap: '3px' }}>
-                <button
-                  className={`icon-btn ${canvasViewType === 'original' ? 'active' : ''}`}
-                  onClick={() => setCanvasViewType('original')}
-                  title="View Original Uploaded Scan with Overlays"
-                  style={{
-                    fontSize: '0.72rem',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                    background: canvasViewType === 'original' ? 'var(--primary)' : 'transparent',
-                    color: canvasViewType === 'original' ? '#fff' : 'var(--text-muted)',
-                    fontWeight: 600
-                  }}
-                >
-                  📄 Original Scan
-                </button>
-                <button
-                  className={`icon-btn ${canvasViewType === 'reconstructed' ? 'active' : ''}`}
-                  onClick={() => setCanvasViewType('reconstructed')}
-                  title="View Reconstructed Form with Clean Digital Text"
-                  style={{
-                    fontSize: '0.72rem',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                    background: canvasViewType === 'reconstructed' ? 'var(--primary)' : 'transparent',
-                    color: canvasViewType === 'reconstructed' ? '#fff' : 'var(--text-muted)',
-                    fontWeight: 600
-                  }}
-                >
-                  ✨ Reconstructed
-                </button>
-                <button
-                  className={`icon-btn ${canvasViewType === 'split' ? 'active' : ''}`}
-                  onClick={() => setCanvasViewType('split')}
-                  title="Side-by-Side Comparison: Original vs Reconstructed"
-                  style={{
-                    fontSize: '0.72rem',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                    background: canvasViewType === 'split' ? 'var(--primary)' : 'transparent',
-                    color: canvasViewType === 'split' ? '#fff' : 'var(--text-muted)',
-                    fontWeight: 600
-                  }}
-                >
-                  ↔ Side-by-Side
-                </button>
-              </div>
-
-              {/* Overlay toggles */}
-              <div className="toolbar-group">
+                <div className="toolbar-divider" />
                 <button
                   className={`icon-btn ${showBoundingBoxes ? 'active' : ''}`}
                   onClick={() => setShowBoundingBoxes(!showBoundingBoxes)}
@@ -1485,6 +1566,56 @@ export default function DocumentConverter() {
               onMouseUp={handleCanvasMouseUp}
               style={{ cursor: isDrawMode ? 'crosshair' : (viewMode === 'custom' && zoomLevel > 1.0 ? 'grab' : 'default') }}
             >
+              {/* Floating Quick Action Controls Bar */}
+              <div className="canvas-floating-controls">
+                <button
+                  className="floating-ctrl-btn"
+                  onClick={handleZoomOut}
+                  title="Zoom Out (-)"
+                >
+                  <ZoomOut size={14} />
+                </button>
+                <span
+                  className="floating-ctrl-zoom-text"
+                  onClick={handleFitWidth}
+                  title="Click to reset to Fit Width"
+                >
+                  {viewMode === 'fit-width' ? 'Fit W' : (viewMode === 'fit-page' ? 'Fit Page' : `${Math.round(zoomLevel * 100)}%`)}
+                </span>
+                <button
+                  className="floating-ctrl-btn"
+                  onClick={handleZoomIn}
+                  title="Zoom In (+)"
+                >
+                  <ZoomIn size={14} />
+                </button>
+                <div className="floating-ctrl-divider" />
+                <button
+                  className={`floating-ctrl-btn ${viewMode === 'fit-width' ? 'active' : ''}`}
+                  onClick={handleFitWidth}
+                  title="Fit Document to Width (Recommended for Reading)"
+                >
+                  <Minimize2 size={13} style={{ transform: 'rotate(90deg)' }} />
+                  <span>Fit Width</span>
+                </button>
+                <button
+                  className={`floating-ctrl-btn ${viewMode === 'fit-page' ? 'active' : ''}`}
+                  onClick={handleFitPage}
+                  title="Fit Entire Document Page"
+                >
+                  <Maximize2 size={13} />
+                  <span>Fit Page</span>
+                </button>
+                <div className="floating-ctrl-divider" />
+                <button
+                  className="floating-ctrl-btn"
+                  onClick={() => setRotation(r => (r + 90) % 360)}
+                  title="Rotate Clockwise 90°"
+                >
+                  <RotateCw size={13} />
+                </button>
+              </div>
+
               {canvasViewType === 'split' ? (
                 /* Split Side-by-Side View */
                 <div className="split-canvas-container" style={{ padding: '16px', maxWidth: '1400px' }}>
@@ -1510,6 +1641,7 @@ export default function DocumentConverter() {
                             return (
                               <div
                                 key={field.id}
+                                id={`bbox-split-${field.id}`}
                                 className={`bbox-box ${confClass} ${isSelected ? 'selected' : ''}`}
                                 style={{
                                   left: `${b.x * 100}%`,
@@ -1548,7 +1680,7 @@ export default function DocumentConverter() {
               ) : (
                 /* Single Canvas View (Original or Reconstructed) */
                 <div
-                  className={`canvas-wrapper ${viewMode === 'fit' ? 'mode-fit' : ''}`}
+                  className={`canvas-wrapper ${viewMode === 'fit-width' ? 'mode-fit-width' : (viewMode === 'fit-page' ? 'mode-fit-page' : '')}`}
                   style={viewMode === 'custom' ? {
                     transform: `translate(${panPos.x}px, ${panPos.y}px) scale(${zoomLevel}) rotate(${rotation}deg)`
                   } : {
@@ -1604,6 +1736,7 @@ export default function DocumentConverter() {
                             return (
                               <div
                                 key={field.id}
+                                id={`bbox-${field.id}`}
                                 className={`bbox-box ${confClass} ${isSelected ? 'selected' : ''}`}
                                 style={{
                                   left: `${b.x * 100}%`,
@@ -1667,9 +1800,20 @@ export default function DocumentConverter() {
             <div className="editor-header">
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div>
-                  <h3 style={{ fontSize: '0.98rem', fontWeight: 700 }}>Dynamic Field Verification</h3>
+                  <h3 style={{ fontSize: '0.98rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    Dynamic Field Verification
+                    {isAnalyzing && (
+                      <span style={{ fontSize: '0.72rem', color: 'var(--accent-cyan)', fontWeight: 500, display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                        <RefreshCw size={12} className="animate-spin" /> Detecting layout & values...
+                      </span>
+                    )}
+                  </h3>
                   <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                    {summary.totalFields} dynamic items detected by {doc.engineUsed ? doc.engineUsed.toUpperCase() : 'BUILTIN'} Engine
+                    {isAnalyzing ? (
+                      <span style={{ color: 'var(--accent-cyan)' }}>Scanning form structure, sections, labels & handwriting...</span>
+                    ) : (
+                      `${summary.totalFields} dynamic items detected by ${doc.engineUsed ? doc.engineUsed.toUpperCase() : 'BUILTIN'} Engine`
+                    )}
                   </div>
                 </div>
 
@@ -1678,6 +1822,7 @@ export default function DocumentConverter() {
                   style={{ fontSize: '0.74rem', padding: '5px 10px' }}
                   onClick={verifyAllHighConfidence}
                   title="Verify all fields with >= 85% confidence"
+                  disabled={isAnalyzing}
                 >
                   <ShieldCheck size={13} color="var(--accent-emerald)" />
                   Verify High Conf ({summary.highConfidenceCount})
@@ -1764,259 +1909,288 @@ export default function DocumentConverter() {
 
             {/* Fields List */}
             <div className="fields-list-scroll" ref={fieldsContainerRef}>
-              {/* If Checkboxes Tab Selected: Clean, Responsive Compact Grid */}
-              {filterTab === 'checkboxes' ? (
-                <div className="checkboxes-grid">
-                  {filteredFields.map(field => {
-                    const isSelected = selectedFieldId === field.id;
-                    const isChecked = ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(field.value).toLowerCase());
-                    const confPct = Math.round((field.confidence || 0) * 100);
-
-                    return (
-                      <div
-                        key={field.id}
-                        id={`field-card-${field.id}`}
-                        className={`checkbox-card-compact ${isSelected ? 'selected' : ''} ${isChecked ? 'checked' : ''}`}
-                        onClick={() => {
-                          setSelectedFieldId(field.id);
-                          if (field.page && field.page !== currentPage) {
-                            setCurrentPage(field.page);
-                          }
-                        }}
-                      >
-                        <div className="checkbox-toggle-wrap">
-                          <div
-                            className="checkbox-custom-box"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              updateField(field.id, { value: isChecked ? 'false' : 'true' });
-                            }}
-                            title="Click to toggle checkbox"
-                          >
-                            {isChecked && <Check size={12} strokeWidth={3} />}
-                          </div>
-                          <span className="checkbox-compact-label">{field.label}</span>
-                        </div>
-
-                        <div className="checkbox-compact-actions">
-                          <span style={{ fontSize: '0.7rem', color: isChecked ? 'var(--accent-emerald)' : 'var(--text-dim)', fontWeight: 600 }}>
-                            {isChecked ? '☑ Selected' : '☐ Empty'}
-                          </span>
-
-                          <span className={`confidence-pill ${field.confidence >= 0.85 ? 'high' : 'review'}`} style={{ padding: '1px 5px', fontSize: '0.68rem' }}>
-                            {confPct}%
-                          </span>
-
-                          <button
-                            className={`verify-toggle-btn ${field.verified ? 'verified' : ''}`}
-                            style={{ padding: '2px 6px', fontSize: '0.68rem' }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleVerify(field.id);
-                            }}
-                          >
-                            <Check size={10} />
-                            {field.verified ? 'Verified' : 'Confirm'}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : filterTab === 'tables' && doc.tables?.length > 0 ? (
-                doc.tables.map(tbl => (
-                  <div key={tbl.id} className="field-card">
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                      <div style={{ fontWeight: 700, fontSize: '0.9rem' }}>{tbl.title || 'Extracted Table'}</div>
-                      <span className="brand-badge">Page {tbl.page || 1}</span>
-                    </div>
-
-                    <div className="table-matrix-wrapper">
-                      <table className="dynamic-table-grid">
-                        <thead>
-                          <tr>
-                            {tbl.headers?.map((h, i) => (
-                              <th key={i}>{h}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {tbl.rows?.map((row, rIdx) => (
-                            <tr key={rIdx}>
-                              {row.map((cell, cIdx) => (
-                                <td key={cIdx}>
-                                  <input
-                                    type="text"
-                                    className="table-cell-input"
-                                    value={cell}
-                                    onChange={(e) => updateTableCell(tbl.id, rIdx, cIdx, e.target.value)}
-                                  />
-                                </td>
-                              ))}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-
-                    <div style={{ marginTop: '8px', display: 'flex', justifyContent: 'flex-end' }}>
-                      <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '4px 8px' }} onClick={() => addTableRow(tbl.id)}>
-                        <Plus size={12} /> Add Row
-                      </button>
+              {isAnalyzing ? (
+                <div style={{ padding: '24px 16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 14px', background: 'rgba(56, 189, 248, 0.08)', border: '1px solid rgba(56, 189, 248, 0.25)', borderRadius: '8px' }}>
+                    <RefreshCw size={18} className="animate-spin" style={{ color: 'var(--accent-cyan)', flexShrink: 0 }} />
+                    <div>
+                      <div style={{ fontSize: '0.84rem', fontWeight: 600, color: 'var(--text-main)' }}>Extracting Form Fields & Checkboxes...</div>
+                      <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>Analyzing document layout, reading labels by name, and aligning field coordinates.</div>
                     </div>
                   </div>
-                ))
+                  {[1, 2, 3, 4, 5, 6].map(i => (
+                    <div key={i} style={{
+                      background: 'var(--bg-card)',
+                      border: '1px solid var(--border-subtle)',
+                      borderRadius: '8px',
+                      padding: '12px',
+                      opacity: 0.6 + (i % 2) * 0.3
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                        <div style={{ width: `${50 + (i % 4) * 12}%`, height: '12px', background: 'rgba(255,255,255,0.08)', borderRadius: '4px' }} />
+                        <div style={{ width: '40px', height: '12px', background: 'rgba(255,255,255,0.05)', borderRadius: '4px' }} />
+                      </div>
+                      <div style={{ width: '100%', height: '32px', background: 'rgba(255,255,255,0.04)', borderRadius: '6px' }} />
+                    </div>
+                  ))}
+                </div>
               ) : (
-                /* Dynamic Field Cards for All / Text / Review / Verified */
-                (() => {
-                  const renderFieldCard = (field) => {
-                    const isSelected = selectedFieldId === field.id;
-                    const confPct = Math.round((field.confidence || 0) * 100);
-                    const confClass = field.confidence >= 0.85 ? 'high' : (field.confidence >= 0.50 ? 'review' : 'low');
+                <>
+                  {/* If Checkboxes Tab Selected: Clean, Responsive Compact Grid */}
+                  {filterTab === 'checkboxes' ? (
+                    <div className="checkboxes-grid">
+                      {filteredFields.map(field => {
+                        const isSelected = selectedFieldId === field.id;
+                        const isChecked = ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(field.value).toLowerCase());
+                        const confPct = Math.round((field.confidence || 0) * 100);
 
-                    return (
-                      <div
-                        key={field.id}
-                        id={`field-card-${field.id}`}
-                        className={`field-card ${isSelected ? 'selected' : ''}`}
-                        onClick={() => {
-                          setSelectedFieldId(field.id);
-                          if (field.page && field.page !== currentPage) {
-                            setCurrentPage(field.page);
-                          }
-                        }}
-                      >
-                        {/* Card Header */}
-                        <div className="field-card-header">
-                          <input
-                            type="text"
-                            className="field-label-input"
-                            value={field.label}
-                            onChange={(e) => updateField(field.id, { label: e.target.value })}
-                            title="Click to edit field label"
-                          />
-
-                          <div className="field-badge-group">
-                            <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)', textTransform: 'uppercase' }}>
-                              {field.type}
-                            </span>
-                            <span className={`confidence-pill ${confClass}`}>
-                              {confPct}%
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* Card Input Value */}
-                        {field.type === 'checkbox' ? (
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '4px 0' }}>
-                            <input
-                              type="checkbox"
-                              checked={['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(field.value).toLowerCase())}
-                              onChange={(e) => updateField(field.id, { value: e.target.checked ? 'true' : 'false' })}
-                              style={{ width: '16px', height: '16px', accentColor: 'var(--primary)', cursor: 'pointer' }}
-                            />
-                            <span style={{ fontSize: '0.84rem' }}>
-                              {['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(field.value).toLowerCase()) ? 'Selected / Checked' : 'Not Selected'}
-                            </span>
-                          </div>
-                        ) : field.type === 'multiline' ? (
-                          <textarea
-                            className="field-value-input field-textarea"
-                            value={field.value}
-                            onChange={(e) => updateField(field.id, { value: e.target.value })}
-                            placeholder="(Blank - click to enter value)"
-                          />
-                        ) : (
-                          <input
-                            type="text"
-                            className="field-value-input"
-                            value={field.value}
-                            onChange={(e) => updateField(field.id, { value: e.target.value })}
-                            placeholder="(Blank - click to enter value)"
-                          />
-                        )}
-
-                        {/* Original OCR Reference if edited */}
-                        {field.originalOcrValue !== field.value && (
-                          <div className="original-ocr-box">
-                            <span className="ocr-val-text">OCR was: "{field.originalOcrValue}"</span>
-                            <button
-                              className="revert-btn"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                updateField(field.id, { value: field.originalOcrValue });
-                              }}
-                            >
-                              Revert
-                            </button>
-                          </div>
-                        )}
-
-                        {/* Action Bar */}
-                        <div className="field-actions">
-                          <button
-                            className={`verify-toggle-btn ${field.verified ? 'verified' : ''}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleVerify(field.id);
+                        return (
+                          <div
+                            key={field.id}
+                            id={`field-card-${field.id}`}
+                            className={`checkbox-card-compact ${isSelected ? 'selected' : ''} ${isChecked ? 'checked' : ''}`}
+                            onClick={() => {
+                              scrollToCanvasField(field.id);
+                              if (field.page && field.page !== currentPage) {
+                                setCurrentPage(field.page);
+                              }
                             }}
                           >
-                            <Check size={11} />
-                            {field.verified ? 'Verified' : 'Confirm'}
-                          </button>
+                            <div className="checkbox-toggle-wrap">
+                              <div
+                                className="checkbox-custom-box"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  updateField(field.id, { value: isChecked ? 'false' : 'true' });
+                                }}
+                                title="Click to toggle checkbox"
+                              >
+                                {isChecked && <Check size={12} strokeWidth={3} />}
+                              </div>
+                              <span className="checkbox-compact-label">{field.label}</span>
+                            </div>
 
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                            <button
-                              className="icon-btn"
-                              style={{ width: '24px', height: '24px' }}
-                              title="Mark as Unreadable"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                updateField(field.id, { isUnreadable: true, confidence: 0.2 });
-                              }}
-                            >
-                              <HelpCircle size={13} color="var(--accent-amber)" />
-                            </button>
-                            <button
-                              className="icon-btn"
-                              style={{ width: '24px', height: '24px' }}
-                              title="Remove False Detection"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                deleteField(field.id);
-                              }}
-                            >
-                              <Trash2 size={13} color="var(--accent-rose)" />
-                            </button>
+                            <div className="checkbox-compact-actions">
+                              <span style={{ fontSize: '0.7rem', color: isChecked ? 'var(--accent-emerald)' : 'var(--text-dim)', fontWeight: 600 }}>
+                                {isChecked ? '☑ Selected' : '☐ Empty'}
+                              </span>
+
+                              <span className={`confidence-pill ${field.confidence >= 0.85 ? 'high' : 'review'}`} style={{ padding: '1px 5px', fontSize: '0.68rem' }}>
+                                {confPct}%
+                              </span>
+
+                              <button
+                                className={`verify-toggle-btn ${field.verified ? 'verified' : ''}`}
+                                style={{ padding: '2px 6px', fontSize: '0.68rem' }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleVerify(field.id);
+                                }}
+                              >
+                                <Check size={10} />
+                                {field.verified ? 'Verified' : 'Confirm'}
+                              </button>
+                            </div>
                           </div>
+                        );
+                      })}
+                    </div>
+                  ) : filterTab === 'tables' && doc.tables?.length > 0 ? (
+                    doc.tables.map(tbl => (
+                      <div key={tbl.id} className="field-card">
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                          <div style={{ fontWeight: 700, fontSize: '0.9rem' }}>{tbl.title || 'Extracted Table'}</div>
+                          <span className="brand-badge">Page {tbl.page || 1}</span>
+                        </div>
+
+                        <div className="table-matrix-wrapper">
+                          <table className="dynamic-table-grid">
+                            <thead>
+                              <tr>
+                                {tbl.headers?.map((h, i) => (
+                                  <th key={i}>{h}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {tbl.rows?.map((row, rIdx) => (
+                                <tr key={rIdx}>
+                                  {row.map((cell, cIdx) => (
+                                    <td key={cIdx}>
+                                      <input
+                                        type="text"
+                                        className="table-cell-input"
+                                        value={cell}
+                                        onChange={(e) => updateTableCell(tbl.id, rIdx, cIdx, e.target.value)}
+                                      />
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        <div style={{ marginTop: '8px', display: 'flex', justifyContent: 'flex-end' }}>
+                          <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '4px 8px' }} onClick={() => addTableRow(tbl.id)}>
+                            <Plus size={12} /> Add Row
+                          </button>
                         </div>
                       </div>
-                    );
-                  };
+                    ))
+                  ) : (
+                    /* Dynamic Field Cards for All / Text / Review / Verified */
+                    (() => {
+                      const renderFieldCard = (field) => {
+                        const isSelected = selectedFieldId === field.id;
+                        const confPct = Math.round((field.confidence || 0) * 100);
+                        const confClass = field.confidence >= 0.85 ? 'high' : (field.confidence >= 0.50 ? 'review' : 'low');
 
-                  if (filterTab === 'all' && !searchQuery) {
-                    const sections = categorizeDocFields(filteredFields);
-                    return sections.map(sec => (
-                      <div key={sec.name} className="sidebar-section-group">
-                        <div className="sidebar-section-banner">
-                          <span>📋 {sec.name}</span>
-                          <span className="sidebar-section-badge">{sec.fields.length}</span>
-                        </div>
-                        {sec.fields.map(renderFieldCard)}
-                      </div>
-                    ));
-                  }
+                        return (
+                          <div
+                            key={field.id}
+                            id={`field-card-${field.id}`}
+                            className={`field-card ${isSelected ? 'selected' : ''}`}
+                            onClick={() => {
+                              scrollToCanvasField(field.id);
+                              if (field.page && field.page !== currentPage) {
+                                setCurrentPage(field.page);
+                              }
+                            }}
+                          >
+                            {/* Card Header */}
+                            <div className="field-card-header">
+                              <input
+                                type="text"
+                                className="field-label-input"
+                                value={field.label}
+                                onChange={(e) => updateField(field.id, { label: e.target.value })}
+                                title="Click to edit field label"
+                              />
 
-                  return filteredFields.map(renderFieldCard);
-                })()
+                              <div className="field-badge-group">
+                                <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)', textTransform: 'uppercase' }}>
+                                  {field.type}
+                                </span>
+                                <span className={`confidence-pill ${confClass}`}>
+                                  {confPct}%
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Card Input Value */}
+                            {field.type === 'checkbox' ? (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '4px 0' }}>
+                                <input
+                                  type="checkbox"
+                                  checked={['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(field.value).toLowerCase())}
+                                  onChange={(e) => updateField(field.id, { value: e.target.checked ? 'true' : 'false' })}
+                                  style={{ width: '16px', height: '16px', accentColor: 'var(--primary)', cursor: 'pointer' }}
+                                />
+                                <span style={{ fontSize: '0.84rem' }}>
+                                  {['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(field.value).toLowerCase()) ? 'Selected / Checked' : 'Not Selected'}
+                                </span>
+                              </div>
+                            ) : field.type === 'multiline' ? (
+                              <textarea
+                                className="field-value-input field-textarea"
+                                value={field.value}
+                                onChange={(e) => updateField(field.id, { value: e.target.value })}
+                                placeholder="(Blank - click to enter value)"
+                              />
+                            ) : (
+                              <input
+                                type="text"
+                                className="field-value-input"
+                                value={field.value}
+                                onChange={(e) => updateField(field.id, { value: e.target.value })}
+                                placeholder="(Blank - click to enter value)"
+                              />
+                            )}
+
+                            {/* Original OCR Reference if edited */}
+                            {field.originalOcrValue !== field.value && (
+                              <div className="original-ocr-box">
+                                <span className="ocr-val-text">OCR was: "{field.originalOcrValue}"</span>
+                                <button
+                                  className="revert-btn"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateField(field.id, { value: field.originalOcrValue });
+                                  }}
+                                >
+                                  Revert
+                                </button>
+                              </div>
+                            )}
+
+                            {/* Action Bar */}
+                            <div className="field-actions">
+                              <button
+                                className={`verify-toggle-btn ${field.verified ? 'verified' : ''}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleVerify(field.id);
+                                }}
+                              >
+                                <Check size={11} />
+                                {field.verified ? 'Verified' : 'Confirm'}
+                              </button>
+
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <button
+                                  className="icon-btn"
+                                  style={{ width: '24px', height: '24px' }}
+                                  title="Mark as Unreadable"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateField(field.id, { isUnreadable: true, confidence: 0.2 });
+                                  }}
+                                >
+                                  <HelpCircle size={13} color="var(--accent-amber)" />
+                                </button>
+                                <button
+                                  className="icon-btn"
+                                  style={{ width: '24px', height: '24px' }}
+                                  title="Remove False Detection"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    deleteField(field.id);
+                                  }}
+                                >
+                                  <Trash2 size={13} color="var(--accent-rose)" />
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      };
+
+                      if (filterTab === 'all' && !searchQuery) {
+                        const sections = categorizeDocFields(filteredFields);
+                        return sections.map(sec => (
+                          <div key={sec.name} className="sidebar-section-group">
+                            <div className="sidebar-section-banner">
+                              <span>📋 {sec.name}</span>
+                              <span className="sidebar-section-badge">{sec.fields.length}</span>
+                            </div>
+                            {sec.fields.map(renderFieldCard)}
+                          </div>
+                        ));
+                      }
+
+                      return filteredFields.map(renderFieldCard);
+                    })()
+                  )}
+
+                  {/* Add Field Button */}
+                  <div style={{ padding: '6px 0', textAlign: 'center' }}>
+                    <button className="btn btn-secondary" style={{ width: '100%' }} onClick={() => addNewField()}>
+                      <Plus size={13} /> Add Missing Field
+                    </button>
+                  </div>
+                </>
               )}
-
-              {/* Add Field Button */}
-              <div style={{ padding: '6px 0', textAlign: 'center' }}>
-                <button className="btn btn-secondary" style={{ width: '100%' }} onClick={() => addNewField()}>
-                  <Plus size={13} /> Add Missing Field
-                </button>
-              </div>
             </div>
           </section>
         </div>

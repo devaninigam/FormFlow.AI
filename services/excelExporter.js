@@ -32,9 +32,13 @@ class ExcelExporter {
       return ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(v);
     };
 
+    // Early Years Accident = main FormFlow export layout when classifier says so
     const isAccidentReport =
-      /accident|incident|example\s*[12]/i.test(`${docData.documentTitle || ''} ${docData.filename || ''}`) ||
-      fields.some(f => /riddor|injury|incident|daycare|toybox|ey staff/i.test(f.label || ''));
+      docData.formLayout === 'early_years_accident' ||
+      ((docData.formLayout !== 'dynamic') && (
+        /accident|incident|example\s*[12]/i.test(`${docData.documentTitle || ''} ${docData.filename || ''}`) ||
+        fields.some(f => /riddor|name of the person involved|ey staff|toybox/i.test(f.label || ''))
+      ));
 
     // -------------------------------------------------------------
     // SHEET 1: Digital Form (Matches Document Visual Structure)

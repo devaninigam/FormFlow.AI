@@ -10,37 +10,53 @@ class AccidentReportPdfGenerator {
   static async generate(docData) {
     const fields = docData.fields || [];
 
-    const getVal = (regex, fallback = '') => {
-      const f = fields.find(item => item && item.label && regex.test(item.label));
-      if (!f || f.value === undefined || f.value === null) return fallback;
-      const v = String(f.value).trim();
-      return v !== '' ? v : fallback;
+    const getByKey = (key, fallback = '') => {
+      const f = fields.find(item => item && item.fieldKey === key);
+      if (f && f.value !== undefined && f.value !== null && String(f.value).trim() !== '') {
+        return String(f.value).trim();
+      }
+      return fallback;
     };
 
-    const isChecked = (regex) => {
-      const f = fields.find(item => item && item.label && regex.test(item.label) && (item.type === 'checkbox' || ['true', 'false'].includes(String(item.value).toLowerCase())));
+    const getVal = (regex, fallback = '') => {
+      const hits = (fields || []).filter(item => item && item.label && regex.test(item.label));
+      for (const f of hits) {
+        if (f.value === undefined || f.value === null) continue;
+        const v = String(f.value).trim();
+        if (v) return v;
+      }
+      return fallback;
+    };
+
+    const isChecked = (keyOrRegex) => {
+      let f;
+      if (typeof keyOrRegex === 'string') {
+        f = fields.find(item => item && item.fieldKey === keyOrRegex);
+      } else {
+        f = fields.find(item => item && item.label && keyOrRegex.test(item.label) && (item.type === 'checkbox' || ['true', 'false'].includes(String(item.value).toLowerCase())));
+      }
       if (!f || f.value === undefined || f.value === null) return false;
       const v = String(f.value).toLowerCase().trim();
       return ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(v);
     };
 
-    const refNo = getVal(/ref\s*no|reference/i, '');
-    const formDate = getVal(/^form date/i, '');
-    const project = getVal(/project name|project/i, '');
-    const address = getVal(/building address|address/i, '');
+    const refNo = getByKey('refNo', getVal(/ref\s*no|reference/i, ''));
+    const formDate = getByKey('formDate', getVal(/^form date/i, ''));
+    const project = getByKey('projectName', getVal(/project name/i, ''));
+    const address = getByKey('bldgAddress', getVal(/building address/i, ''));
 
-    const name = getVal(/name of the person/i, '');
-    const dob = getVal(/d\.o\.b|date of birth/i, '');
-    const age = getVal(/^age/i, '');
-    const regAddress = getVal(/registered address/i, '');
-    const postcode = getVal(/postcode/i, '');
-    const contact = getVal(/contact number/i, '');
-    const adult = getVal(/responsible adult/i, '');
-    const session = getVal(/session/i, '');
+    const name = getByKey('personName', getVal(/name of the person/i, ''));
+    const dob = getByKey('dob', getVal(/d\.o\.b|date of birth/i, ''));
+    const age = getByKey('age', getVal(/^age$/i, ''));
+    const regAddress = getByKey('regAddress', getVal(/registered address/i, ''));
+    const postcode = getByKey('postcode', getVal(/^postcode$/i, ''));
+    const contact = getByKey('contactNumber', getVal(/contact number/i, ''));
+    const adult = getByKey('responsibleAdult', getVal(/responsible adult/i, ''));
+    const session = getByKey('session', getVal(/session activity|^session$/i, ''));
 
-    const incDate = getVal(/^incident date/i, '');
-    const incTime = getVal(/incident time|^time/i, '');
-    const location = getVal(/space|location|room/i, '');
+    const incDate = getByKey('incidentDate', getVal(/^incident date$/i, ''));
+    const incTime = getByKey('incidentTime', getVal(/incident time/i, ''));
+    const location = getByKey('location', getVal(/space\s*\/\s*location/i, ''));
 
     const narrative = getVal(/narrative/i, '');
     const completedBy = getVal(/completed by/i, '');
@@ -213,16 +229,16 @@ class AccidentReportPdfGenerator {
     ], 21);
     drawGridRow([
       { pct: 16, isHdr: true, text: 'STAFF' },
-      { pct: 21, isCheckbox: true, label: 'EY Staff', checked: isChecked(/staff:\s*ey staff/i), bg: isChecked(/staff:\s*ey staff/i) ? '#F0FDF4' : '#FFFFFF' },
-      { pct: 21, isCheckbox: true, label: 'Non EY Staff', checked: isChecked(/staff:\s*non ey/i) },
-      { pct: 21, isCheckbox: true, label: 'Visitor', checked: isChecked(/staff:\s*visitor/i) },
-      { pct: 21, isCheckbox: true, label: 'Parent', checked: isChecked(/staff:\s*parent/i) }
+      { pct: 21, isCheckbox: true, label: 'EY Staff', checked: isChecked('staffEy'), bg: isChecked('staffEy') ? '#F0FDF4' : '#FFFFFF' },
+      { pct: 21, isCheckbox: true, label: 'Non EY Staff', checked: isChecked('staffNonEy') },
+      { pct: 21, isCheckbox: true, label: 'Visitor', checked: isChecked('staffVisitor') },
+      { pct: 21, isCheckbox: true, label: 'Parent', checked: isChecked('staffParent') }
     ], 21);
     drawGridRow([
       { pct: 16, isHdr: true, text: 'CHILD' },
-      { pct: 28, isCheckbox: true, label: 'Daycare', checked: isChecked(/child status:\s*daycare/i), bg: isChecked(/child status:\s*daycare/i) ? '#F0FDF4' : '#FFFFFF' },
-      { pct: 28, isCheckbox: true, label: 'ToyBox', checked: isChecked(/child status:\s*toybox/i) },
-      { pct: 28, isCheckbox: true, label: 'SureStart', checked: isChecked(/child status:\s*surestart/i) }
+      { pct: 28, isCheckbox: true, label: 'Daycare', checked: isChecked('childDaycare'), bg: isChecked('childDaycare') ? '#F0FDF4' : '#FFFFFF' },
+      { pct: 28, isCheckbox: true, label: 'ToyBox', checked: isChecked('childToybox') },
+      { pct: 28, isCheckbox: true, label: 'SureStart', checked: isChecked('childSurestart') }
     ], 21);
 
     // Discrete session letter boxes
@@ -272,90 +288,90 @@ class AccidentReportPdfGenerator {
     ], 21);
     drawGridRow([
       { pct: 16, isHdr: true, text: 'TYPE' },
-      { pct: 28, isCheckbox: true, label: 'ACCIDENT', checked: isChecked(/incident type:\s*accident|accident/i), bg: isChecked(/incident type:\s*accident|accident/i) ? '#F0FDF4' : '#FFFFFF' },
-      { pct: 28, isCheckbox: true, label: 'INCIDENT', checked: isChecked(/incident type:\s*incident/i) },
-      { pct: 28, isCheckbox: true, label: 'NEAR MISS', checked: isChecked(/near miss/i) }
+      { pct: 28, isCheckbox: true, label: 'ACCIDENT', checked: isChecked('typeAccident'), bg: isChecked('typeAccident') ? '#F0FDF4' : '#FFFFFF' },
+      { pct: 28, isCheckbox: true, label: 'INCIDENT', checked: isChecked('typeIncident') },
+      { pct: 28, isCheckbox: true, label: 'NEAR MISS', checked: isChecked('typeNearMiss') }
     ], 21);
     drawGridRow([
       { pct: 16, isHdr: true, text: 'SEVERITY' },
-      { pct: 28, isCheckbox: true, label: 'RIDDOR', checked: isChecked(/severity:\s*riddor/i) },
-      { pct: 28, isCheckbox: true, label: 'MODERATE', checked: isChecked(/severity:\s*moderate/i), bg: isChecked(/severity:\s*moderate/i) ? '#FEF3C7' : '#FFFFFF', color: isChecked(/severity:\s*moderate/i) ? '#92400E' : '#334155' },
-      { pct: 28, isCheckbox: true, label: 'MINOR', checked: isChecked(/severity:\s*minor/i) }
+      { pct: 28, isCheckbox: true, label: 'RIDDOR', checked: isChecked('severityRiddor') },
+      { pct: 28, isCheckbox: true, label: 'MODERATE', checked: isChecked('severityModerate'), bg: isChecked('severityModerate') ? '#FEF3C7' : '#FFFFFF', color: isChecked('severityModerate') ? '#92400E' : '#334155' },
+      { pct: 28, isCheckbox: true, label: 'MINOR', checked: isChecked('severityMinor') }
     ], 21);
     y += 10;
 
     // 4. RIDDOR ?
     drawBanner('RIDDOR ?');
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'DANGEROUS OCCURRENCE', checked: isChecked(/dangerous/i) },
-      { pct: 50, isCheckbox: true, label: 'REPORTABLE DISEASE', checked: isChecked(/reportable/i) }
+      { pct: 50, isCheckbox: true, label: 'DANGEROUS OCCURRENCE', checked: isChecked('riddorDangerous') },
+      { pct: 50, isCheckbox: true, label: 'REPORTABLE DISEASE', checked: isChecked('riddorDisease') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'INJURY TO PUBLIC', checked: isChecked(/injury to public/i) },
-      { pct: 50, isCheckbox: true, label: 'INJURY 3 DAYS', checked: isChecked(/injury 3 days/i) }
+      { pct: 50, isCheckbox: true, label: 'INJURY TO PUBLIC', checked: isChecked('riddorPublic') },
+      { pct: 50, isCheckbox: true, label: 'INJURY 3 DAYS', checked: isChecked('riddor3Days') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'MAJOR INJURY', checked: isChecked(/major/i) },
-      { pct: 50, isCheckbox: true, label: 'DEATH', checked: isChecked(/death/i) }
+      { pct: 50, isCheckbox: true, label: 'MAJOR INJURY', checked: isChecked('riddorMajor') },
+      { pct: 50, isCheckbox: true, label: 'DEATH', checked: isChecked('riddorDeath') }
     ], 20);
     y += 10;
 
     // 5. CAUSE
     drawBanner('CAUSE');
     drawGridRow([
-      { pct: 34, isCheckbox: true, label: 'CONTACT WITH PEER', checked: isChecked(/contact with peer|cause:\s*contact/i) },
-      { pct: 33, isCheckbox: true, label: 'EQUIPMENT', checked: isChecked(/equipment/i) },
-      { pct: 33, isCheckbox: true, label: 'UNKNOWN', checked: isChecked(/unknown/i) }
+      { pct: 34, isCheckbox: true, label: 'CONTACT WITH PEER', checked: isChecked('causePeer') },
+      { pct: 33, isCheckbox: true, label: 'EQUIPMENT', checked: isChecked('causeEquip') },
+      { pct: 33, isCheckbox: true, label: 'UNKNOWN', checked: isChecked('causeUnknown') }
     ], 20);
     drawGridRow([
-      { pct: 34, isCheckbox: true, label: 'SLIP / TRIP / FALL', checked: isChecked(/slip/i) },
-      { pct: 33, isCheckbox: true, label: 'COSHH', checked: isChecked(/coshh/i) },
-      { pct: 33, isCheckbox: true, label: 'TRAFFIC', checked: isChecked(/traffic/i) }
+      { pct: 34, isCheckbox: true, label: 'SLIP / TRIP / FALL', checked: isChecked('causeSlip') },
+      { pct: 33, isCheckbox: true, label: 'COSHH', checked: isChecked('causeCoshh') },
+      { pct: 33, isCheckbox: true, label: 'TRAFFIC', checked: isChecked('causeTraffic') }
     ], 20);
     drawGridRow([
-      { pct: 34, isCheckbox: true, label: 'MANUAL HANDLING', checked: isChecked(/manual/i) },
-      { pct: 33, isCheckbox: true, label: 'CHOKING', checked: isChecked(/choking/i) },
-      { pct: 33, isCheckbox: true, label: 'VENUE', checked: isChecked(/venue/i) }
+      { pct: 34, isCheckbox: true, label: 'MANUAL HANDLING', checked: isChecked('causeManual') },
+      { pct: 33, isCheckbox: true, label: 'CHOKING', checked: isChecked('causeChoking') },
+      { pct: 33, isCheckbox: true, label: 'VENUE', checked: isChecked('causeVenue') }
     ], 20);
     y += 10;
 
     // 6. TYPE OF INJURY
     drawBanner('TYPE OF INJURY');
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'ABRASION / SMALL CUT / LIGHT BLEED', checked: isChecked(/abrasion|cut/i), bg: isChecked(/abrasion|cut/i) ? '#F0FDF4' : '#FFFFFF' },
-      { pct: 50, isCheckbox: true, label: 'BRUISE / SWELLING / REDNESS', checked: isChecked(/bruise/i) }
+      { pct: 50, isCheckbox: true, label: 'ABRASION / SMALL CUT / LIGHT BLEED', checked: isChecked('injuryCut'), bg: isChecked('injuryCut') ? '#F0FDF4' : '#FFFFFF' },
+      { pct: 50, isCheckbox: true, label: 'BRUISE / SWELLING / REDNESS', checked: isChecked('injuryBruise') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'STRAIN / DISLOCATION', checked: isChecked(/strain/i) },
-      { pct: 50, isCheckbox: true, label: 'FRACTURE / BROKEN BONE', checked: isChecked(/fracture/i) }
+      { pct: 50, isCheckbox: true, label: 'STRAIN / DISLOCATION', checked: isChecked('injuryStrain') },
+      { pct: 50, isCheckbox: true, label: 'FRACTURE / BROKEN BONE', checked: isChecked('injuryFracture') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'INJURY TO HEAD / FACE', checked: isChecked(/injury to head/i) },
-      { pct: 50, isCheckbox: true, label: 'SENSORY LOSS', checked: isChecked(/sensory/i) }
+      { pct: 50, isCheckbox: true, label: 'INJURY TO HEAD / FACE', checked: isChecked('injuryHead') },
+      { pct: 50, isCheckbox: true, label: 'SENSORY LOSS', checked: isChecked('injurySensory') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'LOSS OF CONSCIOUSNESS', checked: isChecked(/consciousness/i) },
-      { pct: 50, isCheckbox: true, label: 'ORGAN INJURY / OPEN WOUND', checked: isChecked(/organ/i) }
+      { pct: 50, isCheckbox: true, label: 'LOSS OF CONSCIOUSNESS', checked: isChecked('injuryConscious') },
+      { pct: 50, isCheckbox: true, label: 'ORGAN INJURY / OPEN WOUND', checked: isChecked('injuryOrgan') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'PROPERTY DAMAGE (INC VEHICLE)', checked: isChecked(/property/i) },
-      { pct: 50, isCheckbox: true, label: 'EMOTIONAL DISTRESS', checked: isChecked(/emotional distress/i) }
+      { pct: 50, isCheckbox: true, label: 'PROPERTY DAMAGE (INC VEHICLE)', checked: isChecked('injuryProperty') },
+      { pct: 50, isCheckbox: true, label: 'EMOTIONAL DISTRESS', checked: isChecked('injuryDistress') }
     ], 20);
     y += 10;
 
     // 7. OUTCOME OF INCIDENT
     drawBanner('OUTCOME OF INCIDENT');
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'RETURN TO ACTIVITIES', checked: isChecked(/return to activities/i), bg: isChecked(/return to activities/i) ? '#F0FDF4' : '#FFFFFF' },
-      { pct: 50, isCheckbox: true, label: 'FIRST AID APPLIED', checked: isChecked(/first aid/i) }
+      { pct: 50, isCheckbox: true, label: 'RETURN TO ACTIVITIES', checked: isChecked('outcomeReturn'), bg: isChecked('outcomeReturn') ? '#F0FDF4' : '#FFFFFF' },
+      { pct: 50, isCheckbox: true, label: 'FIRST AID APPLIED', checked: isChecked('outcomeFirstAid') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'TO RESPONSIBLE ADULT CARE', checked: isChecked(/to responsible/i) },
-      { pct: 50, isCheckbox: true, label: 'NIAS CALLED', checked: isChecked(/nias/i) }
+      { pct: 50, isCheckbox: true, label: 'TO RESPONSIBLE ADULT CARE', checked: isChecked('outcomeAdultCare') },
+      { pct: 50, isCheckbox: true, label: 'NIAS CALLED', checked: isChecked('outcomeNias') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'HOSPITAL ADMITTANCE', checked: isChecked(/hospital/i) },
-      { pct: 50, isCheckbox: true, label: 'EMOTIONAL SUPPORT', checked: isChecked(/emotional support/i) }
+      { pct: 50, isCheckbox: true, label: 'HOSPITAL ADMITTANCE', checked: isChecked('outcomeHospital') },
+      { pct: 50, isCheckbox: true, label: 'EMOTIONAL SUPPORT', checked: isChecked('outcomeSupport') }
     ], 20);
     y += 10;
 

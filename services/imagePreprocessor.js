@@ -108,34 +108,49 @@ class ImagePreprocessor {
   }
 
   /**
-   * Process standard image file (JPEG, PNG, TIFF, WEBP)
+   * Process standard image file (JPEG, PNG, TIFF, WEBP, BMP, etc.)
+   * Auto-orients EXIF, normalizes high-resolution camera photos (e.g. 12MP-48MP)
+   * to safe dimensions to prevent OOM and timeouts, and sharpens low-resolution scans.
    */
   static async extractImagePages(filePath) {
     let image = sharp(filePath, { failOnError: false }).rotate(); // auto-orient based on EXIF
     const metadata = await image.metadata();
 
-    const currentW = metadata.width || 1200;
-    const currentH = metadata.height || 1600;
-    const targetWidth = Math.max(currentW, 2200);
+    let currentW = metadata.width || 1600;
+    let currentH = metadata.height || 2200;
+    // Swap dimensions if EXIF orientation rotated 90 or 270 degrees
+    if (metadata.orientation && metadata.orientation >= 5 && metadata.orientation <= 8) {
+      [currentW, currentH] = [currentH, currentW];
+    }
 
-    let processedImage = image;
+    const maxDim = 2200;
+    const minDim = 1200;
     let finalW = currentW;
     let finalH = currentH;
+    let processedImage = image;
 
-    if (currentW < targetWidth) {
-      const scale = targetWidth / currentW;
-      finalW = targetWidth;
+    if (Math.max(currentW, currentH) > maxDim) {
+      // Scale down excessively large images (e.g. 3024x4032 camera photos)
+      // to optimal OCR resolution (~1650x2200) to keep memory footprint light
+      const scale = maxDim / Math.max(currentW, currentH);
+      finalW = Math.round(currentW * scale);
+      finalH = Math.round(currentH * scale);
+      processedImage = image.resize({ width: finalW, height: finalH, fit: 'inside' });
+    } else if (currentW < minDim) {
+      // Upscale low-res scans for crisp OCR recognition
+      const scale = 1800 / currentW;
+      finalW = 1800;
       finalH = Math.round(currentH * scale);
       processedImage = image.resize({ width: finalW, height: finalH }).sharpen();
     }
 
-    const pngBuffer = await processedImage.png().toBuffer();
+    const pngBuffer = await processedImage.png({ compressionLevel: 6 }).toBuffer();
     return [{
       pageNumber: 1,
       width: finalW,
       height: finalH,
-      pdfPointsWidth: finalW * 0.5,
-      pdfPointsHeight: finalH * 0.5,
+      pdfPointsWidth: Math.round(finalW * 0.5),
+      pdfPointsHeight: Math.round(finalH * 0.5),
       buffer: pngBuffer,
       originalType: metadata.format || 'image'
     }];

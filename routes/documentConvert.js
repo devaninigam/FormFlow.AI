@@ -14,11 +14,20 @@ const JsonExporter = require('../services/jsonExporter');
 const SampleGenerator = require('../services/sampleGenerator');
 const AccidentReportPdfGenerator = require('../services/accidentReportPdfGenerator');
 
-function isAccidentDoc(doc) {
+/**
+ * Early Years Accident is the main FormFlow document format.
+ * Values are filled by label targeting from the upload; layout uses the classic EY form.
+ */
+function isEarlyYearsAccidentDoc(doc) {
   if (!doc) return false;
-  const name = String(doc.filename || doc.documentTitle || '').toLowerCase();
-  return name.includes('accident') || name.includes('incident') ||
-    (doc.fields || []).some(f => /riddor|injury|incident|daycare|toybox|ey staff/i.test(f.label || ''));
+  if (doc.formLayout === 'early_years_accident') return true;
+  if (doc.formLayout === 'dynamic') return false;
+  const labels = (doc.fields || []).map(f => f.label || '').join(' ');
+  return /riddor|ey staff|toybox|surestart|name of the person involved/i.test(labels);
+}
+
+function isAccidentDoc(doc) {
+  return isEarlyYearsAccidentDoc(doc);
 }
 
 // Setup storage directories
@@ -43,18 +52,15 @@ const upload = multer({
   storage,
   limits: { fileSize: 30 * 1024 * 1024 }, // 30 MB
   fileFilter: (req, file, cb) => {
-    const allowedMimes = [
-      'application/pdf',
-      'image/png',
-      'image/jpeg',
-      'image/jpg',
-      'image/webp',
-      'image/tiff'
-    ];
-    if (allowedMimes.includes(file.mimetype) || file.originalname.match(/\.(pdf|png|jpe?g|webp|tiff)$/i)) {
+    const isImageOrPdf =
+      file.mimetype === 'application/pdf' ||
+      file.mimetype.startsWith('image/') ||
+      /\.(pdf|png|jpe?g|webp|tiff?|bmp|jfif|gif|heic|heif)$/i.test(file.originalname);
+
+    if (isImageOrPdf) {
       cb(null, true);
     } else {
-      cb(new Error('Unsupported file type. Please upload a PDF, PNG, JPG, WEBP, or TIFF file.'));
+      cb(new Error('Unsupported file type. Please upload an image (JPG, PNG, WEBP, TIFF, BMP) or PDF document.'));
     }
   }
 });
@@ -251,8 +257,17 @@ router.post('/analyze/:id', async (req, res) => {
     doc.tables = analysisResult.tables || [];
     doc.summary = analysisResult.summary || {};
     doc.engineUsed = analysisResult.engineUsed;
+    doc.formLayout = analysisResult.formLayout || analysisResult.summary?.formLayout || 'dynamic';
     doc.status = analysisResult.status || 'analyzed';
     doc.extractedAt = new Date().toISOString();
+
+    // Persist OCR fullText onto pages when engine provides it
+    if (analysisResult.pages && doc.pages) {
+      for (const rp of analysisResult.pages) {
+        const target = doc.pages.find(p => p.pageNumber === rp.pageNumber);
+        if (target && rp.fullText) target.fullText = rp.fullText;
+      }
+    }
 
     saveDocumentState(doc);
 
@@ -264,6 +279,7 @@ router.post('/analyze/:id', async (req, res) => {
         pageCount: doc.pageCount,
         status: doc.status,
         engineUsed: doc.engineUsed,
+        formLayout: doc.formLayout,
         summary: doc.summary,
         fields: doc.fields,
         tables: doc.tables,
@@ -294,6 +310,7 @@ router.get('/document/:id', async (req, res) => {
       pageCount: doc.pageCount,
       status: doc.status,
       engineUsed: doc.engineUsed,
+      formLayout: doc.formLayout || 'dynamic',
       summary: doc.summary,
       fields: doc.fields,
       tables: doc.tables,

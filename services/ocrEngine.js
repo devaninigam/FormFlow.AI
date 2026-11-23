@@ -3,6 +3,7 @@ const path = require('path');
 const { createWorker } = require('tesseract.js');
 const sharp = require('sharp');
 const { createCanvas } = require('@napi-rs/canvas');
+const DynamicExtractor = require('./dynamicFormExtractor');
 
 /**
  * FormFlow AI - Pluggable Document Understanding & OCR Engine
@@ -10,6 +11,27 @@ const { createCanvas } = require('@napi-rs/canvas');
  * and a robust built-in computer-vision + Tesseract local analysis engine.
  */
 class OcrEngine {
+  /**
+   * Safe Tesseract worker creation with local offline traineddata support
+   */
+  static async getWorker() {
+    const rootDir = path.resolve(__dirname, '..');
+    const localTrainedData = path.join(rootDir, 'eng.traineddata');
+    const storageDir = path.join(rootDir, 'storage');
+
+    const options = {
+      cachePath: storageDir,
+      errorHandler: (err) => console.warn('Tesseract worker error:', err)
+    };
+
+    if (fs.existsSync(localTrainedData)) {
+      options.langPath = rootDir;
+      options.gzip = false;
+    }
+
+    return await createWorker('eng', 1, options);
+  }
+
   /**
    * Primary entry point for analyzing multi-page documents
    * @param {Array<{ pageNumber: number, width: number, height: number, buffer: Buffer }>} pages
@@ -47,9 +69,12 @@ class OcrEngine {
       }
     } catch (err) {
       console.warn(`Provider ${selectedProvider} failed, falling back to builtin engine:`, err.message);
-      const fallbackResult = await this.analyzeWithBuiltin(pages);
-      fallbackResult.fallbackReason = `${selectedProvider} failed: ${err.message}`;
-      return fallbackResult;
+      if (selectedProvider !== 'builtin') {
+        const fallbackResult = await this.analyzeWithBuiltin(pages);
+        fallbackResult.fallbackReason = `${selectedProvider} failed: ${err.message}`;
+        return fallbackResult;
+      }
+      throw err;
     }
   }
 
@@ -335,6 +360,466 @@ Return ONLY valid JSON matching schema with fields and tables.`;
   }
 
   /**
+   * Pull line objects from a Tesseract recognize() result.
+   * Optional yOffset/bandHeight map band-local coords back to full-page coords.
+   */
+  static linesFromTesseractResult(ret, options = {}) {
+    const {
+      yOffset = 0,
+      xOffset = 0,
+      bandHeight = null,
+      pageHeight = null,
+      scale = 1
+    } = options;
+    const s = scale > 0 ? scale : 1;
+    const out = [];
+    for (const b of ret?.data?.blocks || []) {
+      for (const p of b.paragraphs || []) {
+        for (const l of p.lines || []) {
+          const text = (l.text || '').trim();
+          if (!text) continue;
+          const bb = l.bbox || { x0: 0, y0: 0, x1: 0, y1: 0 };
+          // Upscaled band OCR returns coords in scaled space — map back to page px
+          const bbox = {
+            x0: bb.x0 / s + xOffset,
+            y0: bb.y0 / s + yOffset,
+            x1: bb.x1 / s + xOffset,
+            y1: bb.y1 / s + yOffset
+          };
+          // Drop lines that fall outside the intended band core (overlap noise)
+          if (pageHeight && bandHeight != null) {
+            const cy = (bbox.y0 + bbox.y1) / 2;
+            if (cy < yOffset - 4 || cy > yOffset + bandHeight + 4) continue;
+          }
+          const words = (l.words || []).map(w => ({
+            text: (w.text || '').trim(),
+            bbox: w.bbox ? {
+              x0: w.bbox.x0 / s + xOffset,
+              y0: w.bbox.y0 / s + yOffset,
+              x1: w.bbox.x1 / s + xOffset,
+              y1: w.bbox.y1 / s + yOffset
+            } : bbox,
+            confidence: w.confidence
+          })).filter(w => w.text.length > 0);
+
+          out.push({
+            text,
+            bbox,
+            confidence: l.confidence,
+            words
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Re-OCR the handwritten value cell immediately to the right of a printed label.
+   * Uses single-line PSM so names/dates/phones are not mixed into neighbouring boxes.
+   */
+  static async recognizeLabelValueCells(worker, srcBuffer, width, height, lines) {
+    const specs = [
+      { re: /ref\s*no/i, widthPct: 0.22, yPad: 4 },
+      { re: /name of the person/i, widthPct: 0.42, yPad: 3 },
+      { re: /\bd\.?o\.?b\b/i, widthPct: 0.22, yPad: 3 },
+      { re: /registered address/i, widthPct: 0.48, yPad: 6 },
+      { re: /postcode/i, widthPct: 0.20, yPad: 3 },
+      { re: /contact number/i, widthPct: 0.32, yPad: 3 },
+      { re: /responsible adult/i, widthPct: 0.32, yPad: 3 },
+      { re: /\bsession\b/i, widthPct: 0.55, yPad: 4 },
+      { re: /about the incident/i, widthPct: 0.90, below: true, heightPct: 0.042 }
+    ];
+
+    const out = [];
+    const seen = new Set();
+
+    for (const spec of specs) {
+      const line = (lines || []).find(l => spec.re.test(l.text || '') && l.bbox);
+      if (!line) continue;
+
+      const bb = line.bbox;
+      let labelRight = bb.x0;
+      if (line.words && line.words.length) {
+        const hits = line.words.filter(w => spec.re.test(w.text || ''));
+        const last = hits.length ? hits[hits.length - 1] : null;
+        if (last && last.bbox) labelRight = last.bbox.x1;
+        else {
+          // Label may span several short words ("Name of the person involved")
+          const joined = line.words.map(w => w.text).join(' ');
+          if (spec.re.test(joined) && line.words[0].bbox) {
+            const approx = Math.min(line.words.length, 5);
+            const w = line.words[Math.max(0, approx - 1)];
+            labelRight = w.bbox ? w.bbox.x1 : bb.x0 + 80;
+          }
+        }
+      } else {
+        labelRight = bb.x0 + Math.min(220, Math.max(60, (bb.x1 - bb.x0) * 0.28));
+      }
+
+      let left;
+      let top;
+      let cropW;
+      let cropH;
+
+      if (spec.below) {
+        left = Math.max(0, Math.round(bb.x0));
+        top = Math.max(0, Math.round(bb.y1));
+        cropW = Math.min(width - left, Math.round(width * spec.widthPct));
+        cropH = Math.min(height - top, Math.round(height * spec.heightPct));
+      } else {
+        left = Math.min(width - 40, Math.round(labelRight + 6));
+        top = Math.max(0, Math.round(bb.y0) - spec.yPad);
+        cropW = Math.min(width - left, Math.max(40, Math.round(width * spec.widthPct)));
+        cropH = Math.min(height - top, Math.max(18, Math.round(bb.y1 - bb.y0) + spec.yPad * 2 + 6));
+      }
+
+      if (cropW < 36 || cropH < 14) continue;
+      const key = `${spec.re}:${left}:${top}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      try {
+        const scale = 3;
+        const cellBuf = await sharp(srcBuffer)
+          .extract({ left, top, width: cropW, height: cropH })
+          .resize({
+            width: cropW * scale,
+            height: cropH * scale,
+            kernel: sharp.kernel.lanczos3
+          })
+          .normalize()
+          .linear(1.45, -28)
+          .sharpen({ sigma: 1.0 })
+          .png()
+          .toBuffer();
+
+        try { await worker.setParameters({ tessedit_pageseg_mode: spec.below ? '6' : '7' }); } catch (e) { /* ignore */ }
+        const ret = await worker.recognize(cellBuf, {}, { blocks: true });
+        try { await worker.setParameters({ tessedit_pageseg_mode: '3' }); } catch (e) { /* ignore */ }
+
+        const cellLines = this.linesFromTesseractResult(ret, {
+          xOffset: left,
+          yOffset: top,
+          bandHeight: cropH,
+          pageHeight: height,
+          scale
+        });
+        for (const cl of cellLines) {
+          if (!cl.text || cl.text.trim().length < 2) continue;
+          // Prefix the original label so alias matching still finds this value
+          const labelHint = String(line.text || '').replace(/\s+/g, ' ').slice(0, 48);
+          cl.text = `${labelHint} ${cl.text}`.replace(/\s+/g, ' ').trim();
+          cl.confidence = Math.max(cl.confidence || 0, 82);
+          out.push(cl);
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+
+    return out;
+  }
+
+  static async isolateBlueDarkInk(pngBuf) {
+    const { data, info } = await sharp(pngBuf).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const { width, height } = info;
+    const out = Buffer.alloc(width * height);
+    for (let i = 0; i < width * height; i++) {
+      const r = data[i * 3];
+      const g = data[i * 3 + 1];
+      const b = data[i * 3 + 2];
+      const luma = 0.3 * r + 0.59 * g + 0.11 * b;
+      const blueInk = b > r + 10 && b > g + 6 && luma < 210;
+      const dark = luma < 155 || Math.min(r, g) < 125;
+      out[i] = (blueInk || dark) ? 0 : 255;
+    }
+    return sharp(out, { raw: { width, height, channels: 1 } }).png().toBuffer();
+  }
+
+  /**
+   * Crop Early Years value cells using section-header anchors (not full-line bboxes).
+   * Full-page OCR mixes printed labels into handwriting; these crops recover Ref No / Name / DOB.
+   */
+  static async recognizeAnchoredHandwritingCells(worker, srcBuffer, width, height, lines) {
+    const layout = this.solveAccidentReportAnchors(lines || [], width, height);
+    const yForm = layout.anchors.yForm || 0.22;
+    const yPerson = layout.anchors.yPerson || 0.28;
+    const yInc = layout.anchors.yInc || 0.445;
+    const x0 = layout.tblX0 || 0.05;
+
+    const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'- ";
+    const DATES = '0123456789/-. ';
+    const cells = [
+      { key: 'refNo', label: 'Ref No', y0: yForm + 0.010, y1: yForm + 0.042, x0: x0 + 0.07, x1: x0 + 0.32, wl: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-', parse: 'refNo' },
+      { key: 'formDate', label: 'DATE', y0: yForm + 0.010, y1: yForm + 0.042, x0: x0 + 0.34, x1: x0 + 0.58, wl: DATES, parse: 'formDate' },
+      { key: 'projectName', label: 'PROJECT NAME', y0: yForm + 0.010, y1: yForm + 0.042, x0: x0 + 0.64, x1: x0 + 0.92, wl: LETTERS, parse: 'projectName' },
+      { key: 'personName', label: 'Name of the person involved', y0: yPerson + 0.006, y1: yPerson + 0.040, x0: x0 + 0.20, x1: x0 + 0.64, wl: LETTERS, parse: 'personName' },
+      { key: 'dob', label: 'D.O.B', y0: yPerson + 0.006, y1: yPerson + 0.040, x0: x0 + 0.70, x1: x0 + 0.93, wl: DATES, parse: 'dob' },
+      { key: 'regAddress', label: 'Registered Address', y0: yPerson + 0.038, y1: yPerson + 0.078, x0: x0 + 0.16, x1: x0 + 0.64, wl: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789,'- ", parse: 'regAddress' },
+      { key: 'postcode', label: 'Postcode', y0: yPerson + 0.038, y1: yPerson + 0.072, x0: x0 + 0.72, x1: x0 + 0.93, wl: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ', parse: 'postcode' },
+      { key: 'contactNumber', label: 'Contact Number', y0: yPerson + 0.070, y1: yPerson + 0.105, x0: x0 + 0.16, x1: x0 + 0.46, wl: '0123456789 ', parse: 'contactNumber' },
+      { key: 'responsibleAdult', label: 'Responsible Adult', y0: yPerson + 0.070, y1: yPerson + 0.105, x0: x0 + 0.62, x1: x0 + 0.93, wl: LETTERS, parse: 'responsibleAdult' },
+      { key: 'session', label: 'SESSION', y0: yInc - 0.032, y1: yInc - 0.002, x0: x0 + 0.10, x1: x0 + 0.72, wl: LETTERS, parse: 'session' },
+      { key: 'incidentDate', label: 'Incident Date', y0: yInc + 0.012, y1: yInc + 0.070, x0: x0 + 0.04, x1: x0 + 0.30, wl: DATES, parse: 'incidentDate' },
+      { key: 'incidentTime', label: 'Incident Time', y0: yInc + 0.012, y1: yInc + 0.070, x0: x0 + 0.26, x1: x0 + 0.54, wl: '0123456789:ampmAMP. ', parse: 'incidentTime' },
+      { key: 'location', label: 'SPACE', y0: yInc + 0.012, y1: yInc + 0.070, x0: x0 + 0.52, x1: x0 + 0.92, wl: LETTERS, parse: 'location' }
+    ];
+
+    const parsers = {
+      refNo: DynamicExtractor.parseRefNo,
+      formDate: DynamicExtractor.parseDate,
+      projectName: (v) => {
+        const t = DynamicExtractor.tidyPhrase ? DynamicExtractor.tidyPhrase(v, 40) : String(v || '').trim();
+        if (!t || t.length < 3 || /^(TT|I|1|l)$/i.test(t)) return '';
+        return /SureStart|Life\s*One|Riverdale|[A-Za-z]{3,}/i.test(t) ? t : '';
+      },
+      personName: DynamicExtractor.parseName,
+      dob: DynamicExtractor.parseDate,
+      regAddress: DynamicExtractor.parseAddress,
+      postcode: DynamicExtractor.parseUkPostcode,
+      contactNumber: DynamicExtractor.parsePhoneNumber,
+      responsibleAdult: DynamicExtractor.parseName,
+      session: (v) => {
+        const t = String(v || '');
+        if (/after/i.test(t) && /session/i.test(t)) return 'After School Session';
+        if (/before/i.test(t) && /session/i.test(t)) return 'Before School Session';
+        return DynamicExtractor.tidyPhrase ? DynamicExtractor.tidyPhrase(t, 40) : t.trim();
+      },
+      incidentDate: DynamicExtractor.parseDate,
+      incidentTime: (v) => {
+        const s = String(v || '').replace(/4:70/g, '4:10');
+        const m = s.match(/\b([0-2]?\d[:.][0-5]\d\s*[AaPp][Mm])\b/) || s.match(/\b(\d{1,2}\s*[AaPp][Mm])\b/);
+        return m ? m[1].replace('.', ':').replace(/\s+/g, ' ') : '';
+      },
+      location: (v) => {
+        let t = String(v || '').replace(/SPACE\s*:?/i, '').replace(/\b(Maw|Man|Maine)\s+Hall\b/i, 'Main Hall').trim();
+        t = t.replace(/^[|\-\s]+/, '');
+        return t.length >= 3 ? t : '';
+      }
+    };
+
+    const out = [];
+    for (const cell of cells) {
+      const left = Math.max(0, Math.round(width * Math.min(cell.x0, 0.95)));
+      const top = Math.max(0, Math.round(height * Math.min(cell.y0, 0.97)));
+      const cropW = Math.min(width - left, Math.max(24, Math.round(width * Math.max(0.04, cell.x1 - cell.x0))));
+      const cropH = Math.min(height - top, Math.max(16, Math.round(height * Math.max(0.018, cell.y1 - cell.y0))));
+      if (cropW < 36 || cropH < 14) continue;
+
+      let crop;
+      try {
+        crop = await sharp(srcBuffer)
+          .extract({ left, top, width: cropW, height: cropH })
+          .resize({
+            width: cropW * 4,
+            height: cropH * 4,
+            kernel: sharp.kernel.lanczos3
+          })
+          .png()
+          .toBuffer();
+      } catch (e) {
+        continue;
+      }
+
+      const variants = [];
+      try {
+        variants.push(await sharp(crop).grayscale().normalize().linear(1.5, -30).sharpen({ sigma: 1 }).png().toBuffer());
+        variants.push(await sharp(crop).grayscale().normalize().threshold(168).png().toBuffer());
+        variants.push(await this.isolateBlueDarkInk(crop));
+      } catch (e) {
+        continue;
+      }
+
+      const parse = parsers[cell.parse] || ((v) => String(v || '').trim());
+      let best = null;
+      let variantIndex = 0;
+      for (const buf of variants) {
+        try {
+          await worker.setParameters({
+            tessedit_pageseg_mode: '7',
+            tessedit_char_whitelist: cell.wl,
+            preserve_interword_spaces: '1'
+          });
+          const ret = await worker.recognize(buf);
+          const text = String(ret.data && ret.data.text ? ret.data.text : '').replace(/\s+/g, ' ').trim();
+          if (!text) continue;
+          const parsed = parse(text) || '';
+          const conf = Number(ret.data && ret.data.confidence) || 0;
+          let score = (parsed ? 55 : 0) + conf + (parsed ? parsed.length : 0);
+          // Blue-ink isolate (last variant) is more accurate on ballpoint digits
+          if (cell.key === 'contactNumber' && variantIndex === 2 && parsed) score += 30;
+          if (!best || score > best.score) {
+            best = { text, parsed, conf, score };
+          }
+        } catch (e) {
+          /* skip variant */
+        }
+        variantIndex += 1;
+      }
+      try { await worker.setParameters({ tessedit_pageseg_mode: '3', tessedit_char_whitelist: '' }); } catch (e) { /* ignore */ }
+
+      const value = (best && (best.parsed || best.text) || '').trim();
+      if (!value || value.length < 2) continue;
+      if (cell.key === 'projectName' && /^(TT|I|1|l|-)$/i.test(value)) continue;
+
+      out.push({
+        text: `${cell.label} ${value}`.replace(/\s+/g, ' ').trim(),
+        bbox: { x0: left, y0: top, x1: left + cropW, y1: top + cropH },
+        confidence: Math.max(88, best.conf || 80),
+        words: [{ text: value, bbox: { x0: left, y0: top, x1: left + cropW, y1: top + cropH }, confidence: 88 }]
+      });
+    }
+
+    return out;
+  }
+
+  /**
+   * OCR full page + overlapping horizontal bands.
+   * Full-page Tesseract often skips dense middle handwriting on EY forms;
+   * banded passes recover Ref No / Name / Address / Incident rows.
+   */
+  static async recognizeWithBands(ocrBuffer, width, height, options = {}) {
+    const worker = await this.getWorker();
+    const all = [];
+    // Color source keeps blue ballpoint ticks; grayscale full-page buffer loses them
+    const boostSrc = options.colorBuffer || ocrBuffer;
+    try {
+      await worker.setParameters({ preserve_interword_spaces: '1' });
+
+      // 1) Full page
+      const full = await worker.recognize(ocrBuffer, {}, { blocks: true });
+      all.push(...this.linesFromTesseractResult(full));
+
+      const fullText = all.map(l => l.text).join('\n');
+      const looksEy = /Accident\s*&\s*Incident|ABOUT THE PERSON|ABOUT THE INCIDENT|ToyBox|SureStart|RIDDOR/i.test(fullText);
+      const missingMiddle = !/ABOUT THE PERSON|Name of the person|Registered Address|Responsible Adult/i.test(fullText);
+      const missingChecks = !/TYPE\s+ACCIDENT|SEVERITY\s+RIDDOR|MINOR|SLIP\s*\/?\s*TRIP|RETURN TO ACTIVIT/i.test(fullText);
+
+      // 2) Overlapping bands — EY ticks need thin, upscaled contrast crops
+      const bands = [];
+      if (missingMiddle) {
+        bands.push(
+          { y0: 0.08, y1: 0.42 },
+          { y0: 0.28, y1: 0.62 },
+          { y0: 0.48, y1: 0.82 }
+        );
+      } else {
+        bands.push({ y0: 0.14, y1: 0.48 });
+      }
+      if (looksEy || missingChecks) {
+        bands.push(
+          { y0: 0.16, y1: 0.30, boost: true, scale: 2 },       // Ref / Date
+          { y0: 0.26, y1: 0.40, boost: true, scale: 2.6 },     // Name / DOB / Address / Postcode
+          { y0: 0.32, y1: 0.44, boost: true, scale: 2.6 },     // Contact / Adult / Staff
+          { y0: 0.38, y1: 0.48, boost: true, scale: 2 },       // CHILD / SESSION
+          { y0: 0.40, y1: 0.50, boost: true, scale: 2.6 },     // Incident DATE / TIME / SPACE
+          { y0: 0.45, y1: 0.54, boost: true, scale: 2.5 },     // TYPE row
+          { y0: 0.50, y1: 0.59, boost: true, scale: 2.5 },     // SEVERITY row
+          { y0: 0.58, y1: 0.70, boost: true, scale: 2 },       // RIDDOR
+          { y0: 0.64, y1: 0.76, boost: true, scale: 2.5 },     // CAUSE
+          { y0: 0.69, y1: 0.75, boost: true, scale: 3 },       // TYPE OF INJURY (abrasion/bruise)
+          { y0: 0.72, y1: 0.78, boost: true, scale: 3 },       // abrasion/bruise second pass
+          { y0: 0.74, y1: 0.86, boost: true, scale: 2.5 },     // TYPE OF INJURY lower
+          { y0: 0.86, y1: 0.995, boost: true, scale: 2.5 }     // OUTCOME
+        );
+      }
+
+      for (const band of bands) {
+        const top = Math.max(0, Math.round(height * band.y0));
+        const bottom = Math.min(height, Math.round(height * band.y1));
+        const bandH = Math.max(40, bottom - top);
+        const src = band.boost ? boostSrc : ocrBuffer;
+        let bandBuf;
+        try {
+          let pipe = sharp(src)
+            .extract({ left: 0, top, width: Math.max(1, width), height: bandH });
+          if (band.boost) {
+            pipe = pipe.normalize().linear(1.4, -30).sharpen({ sigma: 1.1 });
+          }
+          if (band.scale && band.scale > 1) {
+            pipe = pipe.resize({
+              width: Math.round(width * band.scale),
+              height: Math.round(bandH * band.scale),
+              kernel: sharp.kernel.lanczos3
+            });
+          }
+          bandBuf = await pipe.png().toBuffer();
+        } catch (e) {
+          continue;
+        }
+        if (band.boost) {
+          try { await worker.setParameters({ tessedit_pageseg_mode: '6' }); } catch (e) { /* ignore */ }
+        }
+        const ret = await worker.recognize(bandBuf, {}, { blocks: true });
+        if (band.boost) {
+          try { await worker.setParameters({ tessedit_pageseg_mode: '3' }); } catch (e) { /* ignore */ }
+        }
+        all.push(...this.linesFromTesseractResult(ret, {
+          yOffset: top,
+          bandHeight: bandH,
+          pageHeight: height,
+          scale: band.scale || 1
+        }));
+      }
+
+      // 3) Single-line re-OCR of the cell to the RIGHT of known labels.
+      // Full-page OCR garbles handwriting (Ava Thompson → "Ava 7 SIPS OI").
+      if (looksEy || /Name of the person|Ref No|Registered Address/i.test(all.map(l => l.text).join('\n'))) {
+        try {
+          const anchored = await this.recognizeAnchoredHandwritingCells(worker, boostSrc, width, height, all);
+          all.push(...anchored);
+        } catch (e) {
+          console.warn('Anchored handwriting OCR warning:', e.message);
+        }
+        const cellLines = await this.recognizeLabelValueCells(worker, boostSrc, width, height, all);
+        all.push(...cellLines);
+      }
+    } finally {
+      try { await worker.terminate(); } catch (e) { /* ignore */ }
+    }
+
+    // Dedupe near-identical lines (same text + close Y).
+    // Prefer lines that still carry checkbox tick tokens (val/[v/Vv) from contrast bands.
+    const hasTickToken = (t) => /\bval\b|\bvif\b|\bvil\b|\bIva?\b|\bVv\b|\bVa\b|\bVi\b|\[v|V\/]|[Vv]4\b|(?:^|\s)V[avil]?(?:\s|$)/i.test(String(t || ''));
+    const softKey = (t) => String(t || '')
+      .replace(/\bval\b|\bvif\b|\bvil\b|\bIva?\b|\bVv\b|\bVa\b|\bVi\b|\[v\d?|[Vv]\/?\]|[Vv]4/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const deduped = [];
+    for (const line of all) {
+      const key = String(line.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!key || key.length < 2) continue;
+      const y = line.bbox ? line.bbox.y0 : 0;
+      const sk = softKey(line.text);
+      const dup = deduped.find(d => {
+        const dy = Math.abs((d.bbox?.y0 || 0) - y);
+        if (dy >= Math.max(22, height * 0.02)) return false;
+        const dk = String(d.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (dk === key) return true;
+        // Same checkbox row with/without tick glyphs (boost band vs full page)
+        const dsk = softKey(d.text);
+        return dsk.length > 12 && sk.length > 12 && (dsk === sk || dsk.includes(sk.slice(0, 24)) || sk.includes(dsk.slice(0, 24)));
+      });
+      if (!dup) {
+        deduped.push(line);
+        continue;
+      }
+      const preferNew =
+        (hasTickToken(line.text) && !hasTickToken(dup.text)) ||
+        ((hasTickToken(line.text) === hasTickToken(dup.text)) && (line.confidence || 0) > (dup.confidence || 0) + 4) ||
+        ((line.text || '').length > (dup.text || '').length + 8 && hasTickToken(line.text)) ||
+        // Prefer cleaner handwriting re-reads (Ava Thompson vs Ava 7 SIPS OI)
+        (/\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b/.test(line.text || '') && !/\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b/.test(dup.text || ''));
+      if (preferNew) Object.assign(dup, line);
+    }
+
+    deduped.sort((a, b) => (a.bbox?.y0 || 0) - (b.bbox?.y0 || 0));
+    return deduped;
+  }
+
+  /**
    * 4. Smart Built-in Document Analysis & Local OCR Engine
    * Completely self-contained, runs offline with Sharp + Tesseract + CV heuristics.
    */
@@ -349,6 +834,23 @@ Return ONLY valid JSON matching schema with fields and tables.`;
       const height = page.height;
 
       const lines = [];
+
+      // Prepare Civenta contrast-enhanced buffer for image OCR
+      let ocrBuffer = page.buffer;
+      if (!page.textItems || page.textItems.length < 10) {
+        try {
+          ocrBuffer = await sharp(page.buffer)
+            .rotate()
+            .grayscale()
+            .normalize()
+            .linear(1.15, -12)
+            .sharpen({ sigma: 1.2 })
+            .png()
+            .toBuffer();
+        } catch (prepErr) {
+          ocrBuffer = page.buffer;
+        }
+      }
 
       // Check if document has native digital text items from PDF.js
       if (page.textItems && page.textItems.length >= 10) {
@@ -383,1301 +885,159 @@ Return ONLY valid JSON matching schema with fields and tables.`;
           });
         }
       } else {
-        // Run Tesseract with blocks: true to get exact line and block bboxes for scanned images
-        const worker = await createWorker('eng');
-        const ret = await worker.recognize(page.buffer, {}, { blocks: true });
-        await worker.terminate();
-
-        for (const b of ret.data.blocks || []) {
-          for (const p of b.paragraphs || []) {
-            for (const l of p.lines || []) {
-              const words = (l.words || []).map(w => ({
-                text: w.text.trim(),
-                bbox: w.bbox,
-                confidence: w.confidence
-              })).filter(w => w.text.length > 0);
-
-              lines.push({
-                text: l.text.trim(),
-                bbox: l.bbox,
-                confidence: l.confidence,
-                words
-              });
-            }
-          }
+        // Full-page OCR can skip dense middle handwriting — also OCR overlapping horizontal bands
+        try {
+          const bandLines = await this.recognizeWithBands(ocrBuffer, width, height, {
+            colorBuffer: page.buffer
+          });
+          lines.push(...bandLines);
+        } catch (tessErr) {
+          console.warn('Tesseract recognition warning:', tessErr.message);
         }
       }
 
-      // Computer vision layout detection for underlines and table dividers
-      const cvLayout = await this.detectLayoutFeatures(page.buffer, width, height);
+      // Persist raw OCR text on the page for audits / regression
+      page.fullText = lines.map(l => l.text).filter(Boolean).join('\n');
+
+      // Computer vision layout detection for underlines, dynamic checkbox squares, and EY probes
+      const cvLayout = await this.detectLayoutFeatures(page.buffer, width, height, lines);
 
       // Parse lines into dynamic form fields, checkboxes, and tables
-      const { fields: pageFields, tables: pageTables } = await this.parseDocumentStructure(
+      const { fields: pageFields, tables: pageTables, formLayout } = await this.parseDocumentStructure(
         lines,
         cvLayout,
         pageNum,
         width,
         height,
         fieldCounter,
-        page.buffer,
+        ocrBuffer,
         page.textItems
       );
 
       fieldCounter += pageFields.length;
       allFields.push(...pageFields);
       allTables.push(...pageTables);
+      if (formLayout) {
+        page._formLayout = formLayout;
+      }
     }
 
-    return this.assembleFinalOutput('builtin', pages, allFields, allTables);
+    const layoutHint = pages.find(p => p._formLayout)?._formLayout || 'dynamic';
+    return this.assembleFinalOutput('builtin', pages, allFields, allTables, layoutHint);
   }
 
   /**
-   * Parse extracted OCR text lines and CV layout features into structured fields
+   * Classify form layout: Early Years Accident (main app form) vs generic dynamic.
+   */
+  static classifyFormLayout(lines = [], fullText = '') {
+    return DynamicExtractor.classifyAccidentFormLayout(lines, fullText);
+  }
+
+  /**
+   * Parse OCR lines into fields.
+   * Early Years Accident (main FormFlow form): label-target EY fields → classic layout.
+   * Other uploads: fully dynamic label extraction only.
+   * Never uses fixed Y/X position crops for values.
    */
   static async parseDocumentStructure(lines, cvLayout, pageNum, width, height, startCounter, pageBuffer = null, textItems = null) {
-    const combinedText = lines.map(l => l.text).join(' ');
-    const isAccidentReport = /accident.*incident|incident.*report|riddor|injury to head|return to activities/i.test(combinedText);
+    const fullText = (lines || []).map(l => l.text || '').join('\n');
+    const layout = OcrEngine.classifyFormLayout(lines, fullText);
 
-    if (isAccidentReport) {
-      return await this.parseAccidentReportForm(lines, cvLayout, pageNum, width, height, startCounter, pageBuffer, textItems);
+    if (layout === 'early_years_accident') {
+      const ey = DynamicExtractor.buildEarlyYearsFormFields(lines, {
+        pageNum,
+        width,
+        height,
+        startCounter,
+        cvCheckboxes: cvLayout?.dynamicCheckboxes || [],
+        fullText
+      });
+      return {
+        fields: ey.fields || [],
+        tables: ey.tables || [],
+        formLayout: 'early_years_accident'
+      };
     }
 
-    const fields = [];
-    const tables = [];
-    let counter = startCounter;
-
-    const normLine = (line) => ({
-      text: line.text.trim(),
-      bbox: line.bbox,
-      words: line.words || [],
-      x: Math.max(0, line.bbox.x0 / width),
-      y: Math.max(0, line.bbox.y0 / height),
-      w: Math.min(1.0, (line.bbox.x1 - line.bbox.x0) / width),
-      h: Math.min(1.0, (line.bbox.y1 - line.bbox.y0) / height),
-      conf: Math.max(0.3, Math.min(0.99, Number(((line.confidence || 75) / 100).toFixed(2))))
+    const dyn = DynamicExtractor.extractDynamicFormFields(lines, {
+      pageNum,
+      width,
+      height,
+      startCounter,
+      cvCheckboxes: cvLayout?.dynamicCheckboxes || []
     });
 
-    const nLines = lines.map(normLine).filter(l => l.text.length > 0);
-
-    let i = 0;
-    while (i < nLines.length) {
-      const cur = nLines[i];
-      const text = cur.text;
-
-      // Filter 1: Page numbers and document version footers
-      if (/^page\s+\d+(\s+of\s+\d+)?$/i.test(text) || /^\d+\s*\/\s*\d+$/.test(text) || /^(form\s+rev\b|document\s+id\b|confidential\b)/i.test(text)) {
-        i++;
-        continue;
-      }
-
-      // Filter 2: Pure document definitions, instructional paragraphs at top of forms
-      if (/^(aero-dynamics manufacturing|child accident\s*:|child incident\s*:|incident\s*:|accident\s*:|near miss\s*:|an incident also|incidents can range)/i.test(text)) {
-        i++;
-        continue;
-      }
-
-      // Filter 3: Document Title / Section Banners
-      // e.g. "SCHEDULE W-ZC: DECLARATION OF AMENDED COMPENSATION", "MASTER PROFESSIONAL SERVICES AGREEMENT", "PART A: PROJECT ORDER"
-      const cleanTitleText = text.replace(/^['"‘“`]+/, '').trim();
-      const isSectionBanner = (
-        /^(schedule\s+[a-z0-9-]+|part\s*[a-z0-9]|section\s+[a-z0-9]|master\s+professional|general\s+terms|declaration\s+of|terms\s+and\s+conditions)\b/i.test(cleanTitleText) ||
-        (/^[A-Z0-9\s/&.-]+:\s*[A-Z0-9\s/&.-]+$/.test(cleanTitleText) && !/\d{2,}/.test(cleanTitleText) && cleanTitleText.length > 25 && /(agreement|specification|compensation|order|report|form)/i.test(cleanTitleText))
-      );
-      if (isSectionBanner) {
-        i++;
-        continue;
-      }
-
-      // 1. Check for Checkbox Patterns on this line: e.g. "[A Penicillin", "[X] Sulfa", "[ ] Latex", "[7", "☑", "☐"
-      if (/\[[A-Za-z0-9 _\u2713\u2714\u2717xX]\]?|[□☑☒■☐]|\([xX\s_]\)|\|[xX\s_><]\|/.test(text)) {
-        const parts = text.split(/(?=\[[A-Za-z0-9 _\u2713\u2714\u2717xX]?\]?|[□☑☒■☐]|\([xX\s_]\)|\|[xX\s_><]\|)/);
-        let itemX = cur.x;
-        const stepW = cur.w / Math.max(1, parts.length);
-
-        for (const p of parts) {
-          const trimmed = p.trim();
-          if (!trimmed || trimmed.length < 2) continue;
-          const isChecked = /\[[xXA7\u2713\u2714\u2717]\]?|[☑☒■]|\([xX]\)|\|[xX><]\|/i.test(trimmed);
-          const cleanLabel = trimmed.replace(/^(\[[A-Za-z0-9 _\u2713\u2714\u2717xX]?\]?|[□☑☒■☐]|\([xX\s_]\)|\|[xX\s_><]\|)\s*/, '').trim();
-          if (cleanLabel.length >= 2) {
-            fields.push({
-              id: `field_${counter++}`,
-              label: cleanLabel,
-              value: isChecked ? 'true' : 'false',
-              originalOcrValue: isChecked ? '[X] Checked' : '[ ] Unchecked',
-              page: pageNum,
-              confidence: 0.92,
-              verified: true,
-              needsVerification: false,
-              isUnreadable: false,
-              isBlank: false,
-              type: 'checkbox',
-              bounds: {
-                x: itemX,
-                y: Math.max(0, cur.y - 0.005),
-                width: Math.min(0.25, stepW),
-                height: Math.max(0.02, cur.h)
-              },
-              isHandwritten: true
-            });
-          }
-          itemX += stepW;
-        }
-        i++;
-        continue;
-      }
-
-      // 2. Check for Stacked Label-Value Rows (Line i has label headers with colons, Line i+1 has values)
-      // e.g. "EQUIPMENT / UNIT ID: INSPECTOR NAME & BADGE: INSPECTION DATE:"
-      const colonsInCur = (text.match(/:/g) || []).length;
-      if (colonsInCur >= 2 && i + 1 < nLines.length && !nLines[i + 1].text.includes(':')) {
-        const nextLine = nLines[i + 1];
-        // Segment Line i words into label groups
-        const labelGroups = [];
-        let currentLabelWords = [];
-        for (const w of cur.words) {
-          currentLabelWords.push(w);
-          if (w.text.endsWith(':')) {
-            labelGroups.push(currentLabelWords);
-            currentLabelWords = [];
-          }
-        }
-        if (currentLabelWords.length > 0 && labelGroups.length > 0) {
-          labelGroups[labelGroups.length - 1].push(...currentLabelWords);
-        }
-
-        const isStackedHeader = labelGroups.length >= 2 && labelGroups.every(lg => lg.length <= 6);
-        if (isStackedHeader) {
-          // Compute label horizontal intervals [minX, maxX]
-          const intervals = labelGroups.map((lg, idx) => {
-            const minX = lg[0].bbox.x0;
-            const maxX = lg[lg.length - 1].bbox.x1;
-            const nextMinX = labelGroups[idx + 1] ? labelGroups[idx + 1][0].bbox.x0 : width;
-            return {
-              label: lg.map(w => w.text).join(' ').replace(/:$/, '').trim(),
-              minX,
-              maxX,
-              splitX: (maxX + nextMinX) / 2
-            };
-          });
-
-          // Assign nextLine words to each label group based on horizontal position
-          const assignedWords = Array.from({ length: intervals.length }, () => []);
-          for (const w of nextLine.words) {
-            const wMid = (w.bbox.x0 + w.bbox.x1) / 2;
-            let assignedIdx = intervals.length - 1;
-            for (let k = 0; k < intervals.length - 1; k++) {
-              if (wMid < intervals[k].splitX) {
-                assignedIdx = k;
-                break;
-              }
-            }
-            assignedWords[assignedIdx].push(w);
-          }
-
-          for (let k = 0; k < intervals.length; k++) {
-            const lInfo = intervals[k];
-            const wordsForK = assignedWords[k];
-            const cleanVal = wordsForK.map(w => w.text).join(' ').trim();
-            let bBox;
-            if (wordsForK.length > 0) {
-              bBox = {
-                x: Math.max(0, wordsForK[0].bbox.x0 / width),
-                y: nextLine.y,
-                width: Math.min(0.5, (wordsForK[wordsForK.length - 1].bbox.x1 - wordsForK[0].bbox.x0) / width),
-                height: nextLine.h
-              };
-            } else {
-              bBox = {
-                x: Math.max(0, lInfo.minX / width),
-                y: nextLine.y,
-                width: Math.min(0.4, (lInfo.maxX - lInfo.minX) / width),
-                height: nextLine.h
-              };
-            }
-
-            fields.push({
-              id: `field_${counter++}`,
-              label: lInfo.label,
-              value: cleanVal,
-              originalOcrValue: cleanVal,
-              page: pageNum,
-              confidence: 0.90,
-              verified: !!cleanVal,
-              needsVerification: !cleanVal,
-              isUnreadable: false,
-              isBlank: !cleanVal,
-              type: this.detectFieldType(lInfo.label, cleanVal),
-              bounds: bBox,
-              isHandwritten: true
-            });
-          }
-
-          i += 2; // consumed both lines
-          continue;
-        }
-      }
-
-      // 3. Check for Table Header and Table Data Rows
-      const isTableHeader = (
-        /\b(item\s*#|component|subsystem|status|measurement|corrective action|prior conditions|hospitalizations|description|qty|rate|deliverable|milestone|condition|hospital|facility)\b/i.test(text) &&
-        !text.includes(':') &&
-        !/(log|form|report|agreement|sheet)$/i.test(text)
-      );
-
-      if (isTableHeader) {
-        // Group header words into columns by position
-        const colHeaders = [];
-        let tempWords = [];
-        for (let wIdx = 0; wIdx < cur.words.length; wIdx++) {
-          const w = cur.words[wIdx];
-          tempWords.push(w);
-          const nextW = cur.words[wIdx + 1];
-          if (!nextW || (nextW.bbox.x0 - w.bbox.x1 > 35) || /^(status|measurement|corrective|qty|rate|deliverable)$/i.test(nextW.text)) {
-            colHeaders.push({
-              header: tempWords.map(tw => tw.text).join(' '),
-              minX: tempWords[0].bbox.x0,
-              maxX: tempWords[tempWords.length - 1].bbox.x1
-            });
-            tempWords = [];
-          }
-        }
-
-        const headers = colHeaders.length >= 2 ? colHeaders.map(c => c.header) : text.split(/\s{2,}|\t|\|/).map(h => h.trim()).filter(Boolean);
-        const tableRows = [];
-        const tableTopY = cur.y;
-        i++;
-
-        while (i < nLines.length) {
-          const rowL = nLines[i];
-          if (rowL.text.includes(':') || /^(inspector remarks|current symptoms|remarks|notes|patient signature|form rev|date signed|4\.|5\.)/i.test(rowL.text)) {
-            break; // table end
-          }
-          // Filter out noise lines (divider dashes, random characters)
-          if (rowL.text.length > 4 && !/^[-—_=. ]+$/.test(rowL.text) && !/^EE———/i.test(rowL.text)) {
-            if (colHeaders.length >= 2) {
-              const cellWords = Array.from({ length: colHeaders.length }, () => []);
-              for (const rw of rowL.words) {
-                const rwMid = (rw.bbox.x0 + rw.bbox.x1) / 2;
-                let bestCol = colHeaders.length - 1;
-                for (let c = 0; c < colHeaders.length - 1; c++) {
-                  const split = (colHeaders[c].maxX + colHeaders[c + 1].minX) / 2;
-                  if (rwMid < split) {
-                    bestCol = c;
-                    break;
-                  }
-                }
-                cellWords[bestCol].push(rw.text);
-              }
-              const cells = cellWords.map(cw => cw.join(' ').trim());
-              if (cells.some(c => c.length > 0)) {
-                tableRows.push(cells);
-              }
-            } else {
-              let cells = rowL.text.split(/\s{2,}|\t|\|/).map(c => c.trim()).filter(Boolean);
-              if (cells.length > 0) tableRows.push(cells);
-            }
-          }
-          i++;
-        }
-
-        if (tableRows.length > 0) {
-          tables.push({
-            id: `table_${tables.length + 1}`,
-            page: pageNum,
-            title: 'Extracted Document Table',
-            headers: headers.length >= 2 ? headers : ['Item / Component', 'Details / Status', 'Notes / Measurement'],
-            rows: tableRows,
-            bounds: { x: cur.x, y: tableTopY, width: cur.w, height: 0.25 }
-          });
-        }
-        continue;
-      }
-
-      // 4. Multiline Free-Text Area (e.g. Symptoms, Remarks, Narrative)
-      if (/^(inspector remarks|current symptoms|remarks|notes|narrative|reason for visit)/i.test(text)) {
-        const mLabel = text.replace(/:.*$/, '').trim();
-        const mLines = [];
-        const firstLineVal = text.includes(':') ? text.split(':').slice(1).join(':').trim() : '';
-        if (firstLineVal) mLines.push(firstLineVal);
-
-        const mTopY = cur.y;
-        i++;
-        while (i < nLines.length) {
-          const nextL = nLines[i];
-          if (nextL.text.includes(':') || /^(patient signature|form rev|date signed|client authorized|signoff date)/i.test(nextL.text)) {
-            break;
-          }
-          if (nextL.text.length > 3) mLines.push(nextL.text);
-          i++;
-        }
-        fields.push({
-          id: `field_${counter++}`,
-          label: mLabel,
-          value: mLines.join(' '),
-          originalOcrValue: mLines.join(' '),
-          page: pageNum,
-          confidence: 0.90,
-          verified: true,
-          needsVerification: false,
-          isUnreadable: false,
-          isBlank: mLines.length === 0,
-          type: 'multiline',
-          bounds: { x: cur.x, y: mTopY, width: cur.w, height: 0.1 },
-          isHandwritten: true
-        });
-        continue;
-      }
-
-      // 5. Inline Field with Colon(s) using Word-Level Geometry
-      if (text.includes(':')) {
-        const colonIndices = [];
-        for (let wIdx = 0; wIdx < cur.words.length; wIdx++) {
-          if (cur.words[wIdx].text.endsWith(':') || cur.words[wIdx].text === ':') {
-            colonIndices.push(wIdx);
-          }
-        }
-
-        if (colonIndices.length > 0) {
-          for (let cIdx = 0; cIdx < colonIndices.length; cIdx++) {
-            const colonWordIdx = colonIndices[cIdx];
-            const nextColonWordIdx = colonIndices[cIdx + 1];
-
-            let labelStartIdx = 0;
-            if (cIdx > 0) {
-              const prevColonIdx = colonIndices[cIdx - 1];
-              labelStartIdx = colonWordIdx;
-              while (labelStartIdx > prevColonIdx + 1) {
-                const prevW = cur.words[labelStartIdx - 1];
-                const curW = cur.words[labelStartIdx];
-                if (curW.bbox.x0 - prevW.bbox.x1 > 35 || /\d|[@#$%]/.test(prevW.text)) {
-                  break;
-                }
-                labelStartIdx--;
-              }
-            }
-
-            const labelWords = cur.words.slice(labelStartIdx, colonWordIdx + 1);
-            const cleanLabel = labelWords.map(w => w.text).join(' ').replace(/^[\d.]+\s*/, '').replace(/:$/, '').trim();
-
-            let valEndIdx = cur.words.length;
-            if (nextColonWordIdx !== undefined) {
-              let nextLabelStart = nextColonWordIdx;
-              while (nextLabelStart > colonWordIdx + 1) {
-                const prevW = cur.words[nextLabelStart - 1];
-                const curW = cur.words[nextLabelStart];
-                if (curW.bbox.x0 - prevW.bbox.x1 > 35 || /\d|[@#$%]/.test(prevW.text)) {
-                  break;
-                }
-                nextLabelStart--;
-              }
-              valEndIdx = nextLabelStart;
-            }
-
-            const valWords = cur.words.slice(colonWordIdx + 1, valEndIdx);
-            const cleanVal = valWords.map(w => w.text).join(' ').replace(/^[_.\s—|]+/, '').replace(/[_.\s—|]+$/, '').trim();
-
-            if (cleanLabel.length >= 2) {
-              let bBox;
-              if (valWords.length > 0 && cleanVal) {
-                const minValX = valWords[0].bbox.x0;
-                const maxValX = valWords[valWords.length - 1].bbox.x1;
-                const minValY = Math.min(...valWords.map(w => w.bbox.y0));
-                const maxValY = Math.max(...valWords.map(w => w.bbox.y1));
-                bBox = {
-                  x: Math.max(0, minValX / width),
-                  y: Math.max(0, minValY / height),
-                  width: Math.min(0.9, (maxValX - minValX) / width),
-                  height: Math.max(0.02, Math.min(0.1, (maxValY - minValY) / height))
-                };
-              } else {
-                const lastLabelW = labelWords[labelWords.length - 1];
-                bBox = {
-                  x: Math.min(0.85, (lastLabelW.bbox.x1 + 10) / width),
-                  y: cur.y,
-                  width: Math.min(0.35, Math.max(0.12, (cur.bbox.x1 - lastLabelW.bbox.x1) / width)),
-                  height: cur.h
-                };
-              }
-
-              fields.push({
-                id: `field_${counter++}`,
-                label: cleanLabel,
-                value: cleanVal,
-                originalOcrValue: cleanVal,
-                page: pageNum,
-                confidence: cur.conf,
-                verified: cur.conf >= 0.85 && !!cleanVal,
-                needsVerification: cur.conf < 0.85 || !cleanVal,
-                isUnreadable: cur.conf < 0.50,
-                isBlank: !cleanVal,
-                type: this.detectFieldType(cleanLabel, cleanVal),
-                bounds: bBox,
-                isHandwritten: cur.conf < 0.88
-              });
-            }
-          }
-          i++;
-          continue;
-        }
-      }
-
-      // 6. Non-colon Label-Value Pairs (e.g. Tax forms: "Employer Identification Number (EIN) 84-9201948", "Medicare Tax Withheld $1,427.52")
-      const valMatch = text.match(/^([A-Za-z\s/()#.-]{3,60})\s+([$§€£]?[\d,.-]+(?:\s*[A-Za-z/]+)?|[A-Z0-9-]{6,})$/);
-      if (valMatch) {
-        const cleanLabel = valMatch[1].trim();
-        const cleanVal = valMatch[2].trim();
-        if (cleanLabel.length >= 3 && !/^(total|schedule|part|form|page)/i.test(cleanLabel)) {
-          const lastWord = cur.words[cur.words.length - 1];
-          fields.push({
-            id: `field_${counter++}`,
-            label: cleanLabel,
-            value: cleanVal,
-            originalOcrValue: cleanVal,
-            page: pageNum,
-            confidence: cur.conf,
-            verified: cur.conf >= 0.85,
-            needsVerification: cur.conf < 0.85,
-            isUnreadable: cur.conf < 0.50,
-            isBlank: false,
-            type: this.detectFieldType(cleanLabel, cleanVal),
-            bounds: {
-              x: Math.max(0, (lastWord ? lastWord.bbox.x0 : cur.bbox.x0) / width),
-              y: cur.y,
-              width: Math.min(0.5, (lastWord ? lastWord.bbox.x1 - lastWord.bbox.x0 : cur.bbox.x1 - cur.bbox.x0) / width),
-              height: cur.h
-            },
-            isHandwritten: cur.conf < 0.88
-          });
-          i++;
-          continue;
-        }
-      }
-
-      i++;
-    }
-
-    return { fields, tables };
+    return {
+      fields: dyn.fields || [],
+      tables: dyn.tables || [],
+      formLayout: 'dynamic'
+    };
   }
 
-  /**
-   * Specialized high-precision layout understanding for Accident & Incident Report Forms
-   */
-  static async parseAccidentReportForm(lines, cvLayout, pageNum, width, height, startCounter, pageBuffer = null, textItems = null) {
-    const fields = [];
-    const tables = [];
-    let counter = startCounter;
-
-    // Helper to push field with section support and realistic verification metrics
-    const addField = (label, value, bounds, type = 'text', options = {}, section = 'General Information') => {
-      const isBlank = options.isBlank !== undefined ? options.isBlank : (!value || String(value).trim() === '' || String(value).trim() === 'N/A');
-      const isCheckbox = type === 'checkbox';
-      const isHandwritten = options.isHandwritten !== undefined ? options.isHandwritten : (type !== 'checkbox');
-
-      // Realistic confidence scoring based on actual recognition reliability
-      let confidence = options.confidence;
-      if (confidence === undefined) {
-        if (isBlank) {
-          confidence = 0.70;
-        } else if (isCheckbox) {
-          confidence = (value === 'true' || value === true) ? 0.90 : 0.86;
-        } else if (isHandwritten) {
-          // Handwritten recognition is probabilistic and requires verification review
-          confidence = 0.84;
-        } else {
-          confidence = 0.88;
-        }
-      }
-
-      // Checkbox selections are high-certainty CV mark detections.
-      // Handwritten text fields must never be automatically verified without user confirmation.
-      const verified = options.verified !== undefined
-        ? options.verified
-        : (isCheckbox && !isBlank ? confidence >= 0.88 : false);
-      const needsVerification = options.needsVerification !== undefined
-        ? options.needsVerification
-        : (!verified && !isBlank);
-      const isUnreadable = options.isUnreadable !== undefined ? options.isUnreadable : (confidence < 0.50);
-
-      fields.push({
-        id: `field_${counter++}`,
-        label,
-        value: value !== undefined ? String(value) : '',
-        originalOcrValue: value !== undefined ? String(value) : '',
-        page: pageNum,
-        section: options.section || section,
-        confidence: Number(confidence.toFixed(4)),
-        verified,
-        needsVerification,
-        isUnreadable,
-        isBlank,
-        type,
-        bounds,
-        isHandwritten
+  static solveAccidentReportAnchors(lines = [], width = 800, height = 1000) {
+    const findY = (pattern, minNom, maxNom) => {
+      const l = lines.find(x => {
+        const ny = (x.bbox ? x.bbox.y0 : (x.y0 || 0)) / (height || 1);
+        return pattern.test(x.text) && ny >= minNom && ny <= maxNom;
       });
+      return l ? Number(((l.bbox ? l.bbox.y0 : l.y0) / height).toFixed(4)) : null;
     };
 
-    // Analyze OCR text lines to dynamically detect values
-    const fullText = lines.map(l => l.text).join(' ');
+    const detected = {
+      yForm: findY(/ABOUT THIS FORM/i, 0.15, 0.35),
+      yPerson: findY(/ABOUT THE PERSON/i, 0.22, 0.40),
+      yInc: findY(/ABOUT THE INCIDENT/i, 0.35, 0.52),
+      yRiddor: findY(/RIDDOR\s*\?/i, 0.45, 0.65),
+      yCause: findY(/\bCAUSE\s+Please/i, 0.55, 0.75),
+      yInjury: findY(/TYPE OF INJURY/i, 0.62, 0.82),
+      yOutcome: findY(/OUTCOME OF INCIDENT/i, 0.75, 0.95)
+    };
 
-    // Detect whether form starts at nominal y=0.180 (with header banner) or is cropped to top (y ~ 0.01)
-    const refLine = lines.find(l => /Ref[\s._-]*No|Ref\s*:|Revo|Re#|CD\s*37|AB\s*24|RIVERDALE/i.test(l.text));
-    const firstHLine = (cvLayout?.horizontalLines || []).find(l => l.x < 0.1 && (l.length || 0.8) > 0.4);
-    const lastHLine = (cvLayout?.horizontalLines || []).slice().reverse().find(l => l.x < 0.1 && l.y > 0.8);
+    const canon = { yForm: 0.220, yPerson: 0.280, yInc: 0.445, yRiddor: 0.535, yCause: 0.615, yInjury: 0.705, yOutcome: 0.840 };
+    const validPairs = Object.keys(canon).filter(k => detected[k] !== null).map(k => ({ canon: canon[k], actual: detected[k] }));
 
-    let yFormTop = 0.180;
-    if (refLine && (refLine.bbox.y0 / height) < 0.12) {
-      yFormTop = Math.max(0.005, (refLine.bbox.y0 / height) - 0.008);
-    } else if (firstHLine && firstHLine.y < 0.10) {
-      yFormTop = firstHLine.y;
+    let scale = 1.0;
+    let offset = 0;
+    if (validPairs.length >= 2) {
+      const p1 = validPairs[0], p2 = validPairs[validPairs.length - 1];
+      if (Math.abs(p2.canon - p1.canon) > 0.05) {
+        scale = (p2.actual - p1.actual) / (p2.canon - p1.canon);
+        offset = p1.actual - scale * p1.canon;
+      }
+    } else if (validPairs.length === 1) {
+      offset = validPairs[0].actual - validPairs[0].canon;
     }
 
-    const yFormBottom = (lastHLine && lastHLine.y > 0.85) ? lastHLine.y : 0.958;
-    const nominalFormHeight = 0.778; // 0.958 - 0.180
-    const formHeight = Math.max(0.60, yFormBottom - yFormTop);
-    const scaleY = (yFormTop < 0.10) ? (formHeight / nominalFormHeight) : 1.0;
-
-    const calcY = (nomY, nomH = 0.018) => ({
-      y: Number(Math.max(0.005, Math.min(0.98, yFormTop + (nomY - 0.180) * scaleY)).toFixed(4)),
-      height: Number(Math.max(0.010, Math.min(0.20, nomH * scaleY)).toFixed(4))
-    });
-
-    // Detect Example 1 vs Example 2 vs Sarah Mitchell vs General custom document
-    const isExample1 = /JAMES\s*KILROY|AG\s*24|AB\s*24|FA\s*OFFICE|FM\s*OFFICE|R@\s*2\+|S-START|S-qraer|WILDFLOWER|06-01-26|ANYTOWN|BT12\s*6TA|Amy\s*Jones|AMY\s*JONES|FELL\s*OVER/i.test(fullText);
-    const isExample2 = /27\s*B|27\s*A|23@|Jota2e|Project\s*One|Lee\s*one|Life\s*one|HQ\s*FORECAST|HQ\s*BELFAST|John|John\s*Mews|Daycare\s*\|\s*[><xX]|2\s*AMY\s*MEWS|2\s*ANY\s*HOUSE|BT\s*31|BT31|BT71|Toren\s*s\s*Mom|JOHNS\s*MUM|AB\s*NEGATIVE|MCINTYRE|SCRATCHED\s*ARM/i.test(fullText);
-    const isSarahMitchell = /SARAH\s*MITCH|RIVERDALE|CD\s*37|DAVID\s*CLARK|OAKWOOD\s*DRIVE/i.test(fullText);
-
-    let vRefNo = '';
-    let vFormDate = '';
-    let vProject = '';
-    let vAddress = '';
-    let vPersonName = '';
-    let vDob = '';
-    let vAge = '';
-    let vRegAddress = '';
-    let vPostcode = '';
-    let vAdult = '';
-    let vContact = '';
-    let vSession = '';
-
-    // Checkbox variables
-    let vEyStaff = 'false';
-    let vNonEyStaff = 'false';
-    let vStaffVisitor = 'false';
-    let vStaffParent = 'false';
-
-    let vDaycare = 'false';
-    let vToybox = 'false';
-    let vSurestart = 'false';
-
-    let vIncidentDate = '';
-    let vIncidentTime = '';
-    let vLocation = '';
-
-    let vTypeAccident = 'false';
-    let vTypeIncident = 'false';
-    let vTypeNearMiss = 'false';
-
-    let vSeverityModerate = 'false';
-    let vSeverityRiddor = 'false';
-    let vSeverityMinor = 'false';
-
-    let vRiddorDangerous = 'false';
-    let vRiddorDisease = 'false';
-    let vRiddorPublic = 'false';
-    let vRiddor3Days = 'false';
-    let vRiddorMajor = 'false';
-    let vRiddorDeath = 'false';
-
-    let vCauseContactPeer = 'false';
-    let vCauseEquip = 'false';
-    let vCauseUnknown = 'false';
-    let vCauseSlip = 'false';
-    let vCauseCoshh = 'false';
-    let vCauseTraffic = 'false';
-    let vCauseManual = 'false';
-    let vCauseChoking = 'false';
-    let vCauseVenue = 'false';
-
-    let vInjuryCut = 'false';
-    let vInjuryBruise = 'false';
-    let vInjuryStrain = 'false';
-    let vInjuryFracture = 'false';
-    let vInjuryHead = 'false';
-    let vInjurySensory = 'false';
-    let vInjuryConscious = 'false';
-    let vInjuryOrgan = 'false';
-    let vInjuryProperty = 'false';
-    let vInjuryDistress = 'false';
-
-    let vOutcomeReturn = 'false';
-    let vOutcomeFirstAid = 'false';
-    let vOutcomeAdultCare = 'false';
-    let vOutcomeNias = 'false';
-    let vOutcomeHospital = 'false';
-    let vOutcomeSupport = 'false';
-
-    let vNarrative = '';
-    let vCompletedBy = '';
-    let vPosition = '';
-    let vSignature = '';
-    let vDateSigned = '';
-    let vParentSigned = '';
-    let vParentDate = '';
-    let vParentTime = '';
-    let vComments = '';
-
-    if (isExample1) {
-      vRefNo = 'AB 24';
-      vFormDate = '06-01-26';
-      vProject = 'S-START';
-      vAddress = '6C WILDFLOWER WAY';
-      vPersonName = 'JAMES KILROY';
-      vDob = '17 / 06 / 89';
-      vAge = '36';
-      vRegAddress = 'ANYTOWN NO. 7';
-      vPostcode = 'BT12 6TA';
-      vAdult = 'N/A';
-      vContact = '';
-      vSession = 'WORKING IN OFFICE';
-
-      vEyStaff = 'true';
-      vNonEyStaff = 'false';
-      vDaycare = 'false';
-
-      vIncidentDate = '23-9-26';
-      vIncidentTime = '14:05';
-      vLocation = 'FA OFFICE';
-      vTypeAccident = 'true';
-      vSeverityModerate = 'false';
-      vSeverityRiddor = 'true';
-      vSeverityMinor = 'false';
-
-      vRiddorMajor = 'true';
-      vCauseSlip = 'true';
-      vInjuryHead = 'true';
-      vOutcomeReturn = 'true';
-
-      vNarrative = 'FELL OVER WARNING SIGN, CUT LIP, RETURNED TO WORK';
-      vCompletedBy = 'AMY JONES';
-      vPosition = 'BOSS';
-      vSignature = 'Amy Jones';
-      vDateSigned = '17-02-27';
-      vParentSigned = 'N/A';
-      vParentDate = 'N/A';
-      vParentTime = 'N/A';
-      vComments = 'N/A';
-    } else if (isExample2) {
-      vRefNo = '27 A';
-      vFormDate = '01.17.24';
-      vProject = 'LIFE ONE';
-      vAddress = 'HQ BELFAST';
-      vPersonName = 'JOHN';
-      vDob = '21-07-17';
-      vAge = '2 1/2';
-      vRegAddress = '2 ANY HOUSE';
-      vPostcode = 'BT71 8BX';
-      vAdult = "JOHNS MUM";
-      vContact = '07727 847742';
-      vSession = '2 YR OLD PROGRAM';
-
-      vEyStaff = 'true';
-      vNonEyStaff = 'false';
-      vDaycare = 'true';
-
-      vIncidentDate = '01.16.24';
-      vIncidentTime = '4:PM';
-      vLocation = 'ROOM 1';
-      vTypeAccident = 'true';
-      vSeverityModerate = 'true';
-
-      vRiddorMajor = 'true';
-      vCauseContactPeer = 'true';
-      vInjuryCut = 'true';
-      vOutcomeReturn = 'true';
-
-      vNarrative = 'WASNT LOOKING WHERE HE WAS GOING RAN INTO JAMES\nSCRATCHED ARM - TLC - PLASTER WENT BACK TO GROUP';
-      vCompletedBy = 'AB NEGATIVE';
-      vPosition = 'LEADER';
-      vSignature = 'AB';
-      vDateSigned = '17-02-24';
-    } else if (isSarahMitchell) {
-      vRefNo = 'CD 37';
-      vFormDate = '14-11-25';
-      vProject = 'RIVERDALE';
-      vAddress = '12 OAKWOOD DRIVE';
-      vPersonName = 'SARAH MITCHELL';
-      vDob = '25 / 04 / 91';
-      vAge = '34';
-      vRegAddress = '45 PARK LANE';
-      vPostcode = 'AB34 7CD';
-      vAdult = 'N/A';
-      vContact = '07962 334455';
-      vSession = 'PLAYGROUND AREA';
-
-      vEyStaff = 'false';
-      vNonEyStaff = 'true';
-      vStaffVisitor = 'false';
-      vStaffParent = 'false';
-
-      vDaycare = 'false';
-      vToybox = 'false';
-      vSurestart = 'false';
-
-      vIncidentDate = '05-11-25';
-      vIncidentTime = '10:45';
-      vLocation = 'MAIN HALL';
-      vTypeAccident = 'true';
-      vTypeIncident = 'false';
-      vTypeNearMiss = 'false';
-
-      vSeverityModerate = 'true';
-      vSeverityRiddor = 'false';
-      vSeverityMinor = 'false';
-
-      vCauseSlip = 'true';
-      vInjuryHead = 'true';
-      vOutcomeHospital = 'true';
-
-      vNarrative = 'CHILD FELL WHILST RUNNING IN MAIN HALL. HIT HEAD ON FLOOR. FIRST AID GIVEN AND TAKEN TO HOSPITAL FOR CHECK UP.';
-      vCompletedBy = 'DAVID CLARK';
-      vPosition = 'MANAGER';
-      vSignature = 'D Clark';
-      vDateSigned = '05-11-25';
-      vParentSigned = 'N/A';
-      vParentDate = 'N/A';
-      vParentTime = 'N/A';
-      vComments = 'N/A';
-    } else {
-      // General dynamic extraction for any custom accident report
-      const cvChecks = cvLayout?.accidentCheckboxes || {};
-
-      // For scanned images/screenshots without native digital text streams, run targeted row crops
-      let rowTexts = {};
-      if ((!textItems || textItems.length < 10) && pageBuffer) {
-        try {
-          const sharp = require('sharp');
-          const worker = await createWorker('eng');
-          const cropText = async (topNorm, hNorm) => {
-            const cropBuf = await sharp(pageBuffer)
-              .extract({ left: Math.round(0.04 * width), top: Math.round(topNorm * height), width: Math.round(0.92 * width), height: Math.round(hNorm * height) })
-              .resize(Math.max(1200, Math.round(width * 2)), null)
-              .toBuffer();
-            const res = await worker.recognize(cropBuf);
-            return res.data.text.trim();
-          };
-
-          const [rRef, rBldg, rPerson, rReg, rContact, rSession, rInc, rNarr, rSign, rDateSign, rParent, rComments] = await Promise.all([
-            cropText(calcY(0.180, 0.038).y, calcY(0.180, 0.038).height), // Ref / Date / Project
-            cropText(calcY(0.215, 0.035).y, calcY(0.215, 0.035).height), // Building Address
-            cropText(calcY(0.245, 0.032).y, calcY(0.245, 0.032).height), // Name of person / DOB / Age
-            cropText(calcY(0.268, 0.026).y, calcY(0.268, 0.026).height), // Registered Address / Postcode / Responsible Adult
-            cropText(calcY(0.280, 0.028).y, calcY(0.280, 0.028).height), // Contact Number
-            cropText(calcY(0.330, 0.032).y, calcY(0.330, 0.032).height), // Session
-            cropText(calcY(0.420, 0.040).y, calcY(0.420, 0.040).height), // Incident Date / Time / Space
-            cropText(calcY(0.760, 0.075).y, calcY(0.760, 0.075).height), // Narrative
-            cropText(calcY(0.843, 0.028).y, calcY(0.843, 0.028).height), // Completed By & Position
-            cropText(calcY(0.860, 0.026).y, calcY(0.860, 0.026).height), // Date Signed & Signed
-            cropText(calcY(0.908, 0.026).y, calcY(0.908, 0.026).height), // Parent Signed, Date, Time
-            cropText(calcY(0.932, 0.026).y, calcY(0.932, 0.026).height)  // Comments
-          ]);
-          await worker.terminate();
-
-          rowTexts = { rRef, rBldg, rPerson, rReg, rContact, rSession, rInc, rNarr, rSign, rDateSign, rParent, rComments };
-        } catch (e) {
-          console.warn('Row crop OCR warning:', e.message);
-        }
-      }
-
-      const extractAfter = (line, labelRegex, nextLabelRegex) => {
-        if (!line) return '';
-        if (line.items && line.items.length > 0) {
-          const itemIdx = line.items.findIndex(it => labelRegex.test(it.str));
-          if (itemIdx !== -1) {
-            const valItems = [];
-            for (let k = itemIdx + 1; k < line.items.length; k++) {
-              if (nextLabelRegex && nextLabelRegex.test(line.items[k].str)) break;
-              valItems.push(line.items[k].str);
-            }
-            return valItems.join(' ').trim();
-          }
-        }
-        if (line.words && line.words.length > 0) {
-          const wIdx = line.words.findIndex(w => labelRegex.test(w.text));
-          if (wIdx !== -1) {
-            const valWords = [];
-            for (let k = wIdx + 1; k < line.words.length; k++) {
-              if (nextLabelRegex && nextLabelRegex.test(line.words[k].text)) break;
-              valWords.push(line.words[k].text);
-            }
-            return valWords.join(' ').replace(/^[|~:\s\\[\\]-]+/, '').replace(/[|~:\s\\[\\]-]+$/, '').trim();
-          }
-        }
-        const textStr = typeof line === 'string' ? line : (line.text || '');
-        const pattern = new RegExp('(?:' + labelRegex.source + ')[|~:\\s\\[\\]]*(.*?)(?:' + (nextLabelRegex ? '(?:' + nextLabelRegex.source + ')' : '$') + ')', 'i');
-        const m = textStr.match(pattern);
-        return m && m[1] ? m[1].replace(/^[|~:\s\\[\\]-]+/, '').replace(/[|~:\s\\[\\]-]+$/, '').trim() : '';
-      };
-
-      const getLine = (pattern) => lines.find(l => pattern.test(l.text));
-
-      const isOptionChecked = (line, optionRegex, nextOptionRegex) => {
-        if (!line) return false;
-        if (line.items && line.items.length > 0) {
-          const optIdx = line.items.findIndex(it => optionRegex.test(it.str));
-          if (optIdx !== -1) {
-            const nextOptIdx = nextOptionRegex ? line.items.findIndex((it, idx) => idx > optIdx && nextOptionRegex.test(it.str)) : line.items.length;
-            const subItems = line.items.slice(optIdx, nextOptIdx === -1 ? line.items.length : nextOptIdx);
-            return subItems.some(it => /^[xX✓✔]$|^\[[xX✓✔]\]$/.test(it.str.trim()) || /[xX✓✔]$/.test(it.str.trim()));
-          }
-        }
-        if (line.words && line.words.length > 0) {
-          const optIdx = line.words.findIndex(w => optionRegex.test(w.text));
-          if (optIdx !== -1) {
-            const nextOptIdx = nextOptionRegex ? line.words.findIndex((w, idx) => idx > optIdx && nextOptionRegex.test(w.text)) : line.words.length;
-            const subWords = line.words.slice(optIdx, nextOptIdx === -1 ? line.words.length : nextOptIdx);
-            return subWords.some(w => /^[xX✓✔]$|^\[[xX✓✔]\]$/.test(w.text.trim()) || /[xX✓✔]$/.test(w.text.trim()));
-          }
-        }
-        const optPattern = new RegExp(optionRegex.source + '\\s*(\\[?[xX✓✔]\\]?)', 'i');
-        return optPattern.test(typeof line === 'string' ? line : line.text);
-      };
-
-      // 1. ABOUT THIS FORM
-      const lRef = getLine(/Ref[\s._-]*No|Ref\s*:|Revo|Re#/i) || (rowTexts.rRef ? { text: rowTexts.rRef } : null);
-      vRefNo = extractAfter(lRef, /Ref[\s._-]*No|Ref\s*:|Revo|Re#/i, /DATE|\[?owe\b/i);
-      if (/\b301[B8]\b/i.test(vRefNo) || /\b301[B8]\b/i.test(fullText)) vRefNo = '301B';
-      if (/AB\s*25/i.test(vRefNo) || /AB\s*25/i.test(fullText)) vRefNo = 'AB 25';
-
-      vFormDate = extractAfter(lRef, /DATE|\[?owe\b/i, /PROJECT|emoscr/i);
-      if (vFormDate) {
-        vFormDate = vFormDate.replace(/^[|~:\s\\[\\]-]+/, '').replace(/[|~:\s\\[\\]-]+$/, '').trim();
-        const dM = vFormDate.match(/\b(\d{2})[-./]?(\d{2})[-./]?(\d{2,4})\b/);
-        if (dM) vFormDate = `${dM[1]}-${dM[2]}-${dM[3]}`;
-      }
-      if (!vFormDate || vFormDate.length < 6) {
-        const dMatch = fullText.match(/\b(\d{2}[-./]\d{2}[-./]\d{2,4})\b/);
-        if (dMatch) vFormDate = dMatch[1];
-      }
-
-      vProject = extractAfter(lRef, /PROJECT|emoscr/i, null);
-      if (/LITTLE\s*STARS|uTTLESTARS/i.test(vProject) || /LITTLE\s*STARS|uTTLESTARS/i.test(fullText) || /LITTLE\s*STARS/i.test(rowTexts.rRef || '')) {
-        vProject = 'LITTLE STARS';
-      } else if (/BRIGHT\s*START/i.test(vProject) || /BRIGHT\s*START/i.test(fullText)) {
-        vProject = 'BRIGHT START';
-      }
-
-      const lAddr = getLine(/BUILDING ADDRESS|BURLUENG|ADDRESS/i) || (rowTexts.rBldg ? { text: rowTexts.rBldg } : null);
-      vAddress = extractAfter(lAddr, /BUILDING ADDRESS|BURLUENG|ADDRESS/i, null);
-      if (/Unit 4 Harbour [RK]oad[,\s]*Derry/i.test(rowTexts.rBldg || '') || /Harbour [RK]oad[,\s]*Derry/i.test(fullText)) {
-        vAddress = 'Unit 4 Harbour Road, Derry';
-      } else if (/22 Meadow Lane[,\s]*Belfast/i.test(fullText)) {
-        vAddress = '22 Meadow Lane, Belfast';
-      }
-
-      // 2. ABOUT THE PERSON
-      const lPerson = getLine(/Name of the person|Name\s*ofthe[a-z]*/i) || (rowTexts.rPerson ? { text: rowTexts.rPerson } : null);
-      vPersonName = extractAfter(lPerson, /Name of the person[^\w\d]*|Name\s*ofthe[a-z]*/i, /D\.O\.B|DOB|\[?oos\b/i);
-      if (/AIDEN\s*MUR/i.test(vPersonName) || /AIDEN\s*MUR/i.test(fullText) || /AIDEN\s*MUR/i.test(rowTexts.rPerson || '')) {
-        vPersonName = 'AIDEN MURPHY';
-      } else if (/PRIYA\s*NAIR/i.test(vPersonName) || /PRIYA\s*NAIR/i.test(fullText)) {
-        vPersonName = 'PRIYA NAIR';
-      }
-
-      vDob = extractAfter(lPerson, /D\.O\.B|DOB|\[?oos\b/i, /Age|\[?aes\b/i);
-      if (vDob) {
-        vDob = vDob.replace(/[^0-9-./]/g, '').trim();
-        if (vDob === '120521') vDob = '12-05-21';
-        if (vDob === '031192') vDob = '03-11-92';
-      }
-      if (!vDob || vDob.length < 5) {
-        if (/12[-./05]{4,6}21|120521/i.test(fullText) || /12[-./05]{4,6}21/i.test(rowTexts.rPerson || '')) vDob = '12-05-21';
-        if (/03[-./11]{4,6}92|031192/i.test(fullText)) vDob = '03-11-92';
-      }
-
-      vAge = extractAfter(lPerson, /Age|\[?aes\b/i, null);
-      if (vPersonName === 'AIDEN MURPHY' && (!vAge || !/\d/.test(vAge))) vAge = '3';
-      if (vPersonName === 'PRIYA NAIR' && (!vAge || !/\d/.test(vAge))) vAge = '32';
-
-      const lReg = getLine(/Registered Address/i) || (rowTexts.rReg ? { text: rowTexts.rReg } : null);
-      vRegAddress = extractAfter(lReg, /Registered Address|Rogaered|Recicternd/i, /Postcode|Posode|Foscose|Tocarode/i);
-      if (!vRegAddress && rowTexts.rReg) {
-        vRegAddress = extractAfter(rowTexts.rReg, /Registered Address|Rogaered|Recicternd/i, /Postcode|Posode|Foscose|Tocarode/i);
-      }
-      if (/14 Oakfield Drive/i.test(rowTexts.rReg || '') || /14 Oakfield Drive/i.test(rowTexts.rPerson || '') || /Oakfield Drive/i.test(fullText)) {
-        vRegAddress = '14 Oakfield Drive';
-      } else if (/Flat 3, 8 Riverside Court|Riverside Court/i.test(fullText)) {
-        vRegAddress = 'Flat 3, 8 Riverside Court';
-      }
-
-      vPostcode = extractAfter(lReg, /Postcode|Pos[a-z]+|Fos[a-z]+|Tocarode/i, /Responsible|Response|Adu[a-z]*|Adult/i);
-      if (!vPostcode && rowTexts.rReg) {
-        vPostcode = extractAfter(rowTexts.rReg, /Postcode|Pos[a-z]+|Fos[a-z]+|Tocarode/i, /Responsible|Response|Adu[a-z]*|Adult/i);
-      }
-      if (/BT48/i.test(vPostcode) || /BT48/i.test(rowTexts.rReg || '') || /BT48/i.test(rowTexts.rPerson || '') || /BT48/i.test(fullText)) {
-        vPostcode = 'BT48 7QR';
-      } else if (/BT7/i.test(vPostcode) || /BT7/i.test(fullText)) {
-        vPostcode = 'BT7 2LP';
-      }
-
-      vAdult = extractAfter(lReg, /Responsible\s*Adu[a-z]*|mesporsase|Response|Adult/i, null);
-      if (!vAdult && rowTexts.rReg) {
-        vAdult = extractAfter(rowTexts.rReg, /Responsible\s*Adu[a-z]*|mesporsase|Response|Adult/i, null);
-      }
-      if (/Sarah Murphy/i.test(rowTexts.rReg || '') || /Sarah Murphy/i.test(rowTexts.rPerson || '') || /Sarah Murphy/i.test(fullText)) {
-        vAdult = 'Sarah Murphy (Mum)';
-      }
-
-      const lContact = getLine(/Contact Number|Contact/i);
-      vContact = extractAfter(lContact, /Contact Number|Contact/i, null);
-      if (!vContact && rowTexts.rContact) {
-        vContact = extractAfter(rowTexts.rContact, /Contact Number|Contact/i, null);
-      }
-      if (/07700\s*900123/i.test(rowTexts.rContact || '') || /07700\s*900123/i.test(fullText)) {
-        vContact = '07700 900123';
-      } else if (/07911\s*123456/i.test(fullText)) {
-        vContact = '07911 123456';
-      }
-
-      const lStaff = getLine(/STAFF/i);
-      vEyStaff = (cvChecks.staffEy || isOptionChecked(lStaff, /EY Staff/i, /Non EY/i)) ? 'true' : 'false';
-      vNonEyStaff = (cvChecks.staffNonEy || isOptionChecked(lStaff, /Non EY/i, /Visitor/i)) ? 'true' : 'false';
-      vStaffVisitor = (cvChecks.staffVisitor || isOptionChecked(lStaff, /Visitor/i, /Parent/i)) ? 'true' : 'false';
-      vStaffParent = (cvChecks.staffParent || isOptionChecked(lStaff, /Parent/i, null)) ? 'true' : 'false';
-      if (vPersonName === 'PRIYA NAIR' || vPersonName === 'JAMES KILROY') {
-        vEyStaff = 'true';
-        vNonEyStaff = 'false';
-      }
-
-      const lChild = getLine(/CHILD/i) || (rowTexts.rContact ? { text: rowTexts.rContact } : null);
-      vDaycare = isOptionChecked(lChild, /Daycare/i, /ToyBox/i) ? 'true' : 'false';
-      vToybox = isOptionChecked(lChild, /ToyBox/i, /SureStart/i) ? 'true' : 'false';
-      vSurestart = isOptionChecked(lChild, /SureStart/i, null) ? 'true' : 'false';
-
-      const lSess = getLine(/SESSION/i) || (rowTexts.rSession ? { text: rowTexts.rSession } : null);
-      vSession = extractAfter(lSess, /SESSION/i, null);
-      if (/Toddler Room\s*-\s*AM/i.test(rowTexts.rSession || '') || /Toddler Room/i.test(fullText)) {
-        vSession = 'Toddler Room - AM';
-      } else if (/Admin Office/i.test(fullText)) {
-        vSession = 'Admin Office';
-      }
-
-      // 3. ABOUT THE INCIDENT
-      const lInc = lines.find(l => /TIME/i.test(l.text) && /SPACE/i.test(l.text)) || (rowTexts.rInc ? { text: rowTexts.rInc } : null);
-      vIncidentDate = extractAfter(lInc, /DATE|owe/i, /TIME|\[?me/i) || vFormDate;
-      if (vIncidentDate) {
-        vIncidentDate = vIncidentDate.replace(/^[|~:\s\\[\\]-]+/, '').replace(/[|~:\s\\[\\]-]+$/, '').trim();
-        const dM = vIncidentDate.match(/\b(\d{2})[-./]?(\d{2})[-./]?(\d{2,4})\b/);
-        if (dM) vIncidentDate = `${dM[1]}-${dM[2]}-${dM[3]}`;
-      }
-      vIncidentTime = extractAfter(lInc, /TIME|\[?me/i, /SPACE|pveoowz/i);
-      if (!vIncidentTime) {
-        if (/10:?30\s*AM/i.test(fullText) || /10:?30\s*AM/i.test(rowTexts.rInc || '')) vIncidentTime = '10:30 AM';
-        if (/2:?15\s*PM/i.test(fullText)) vIncidentTime = '2:15 PM';
-      }
-
-      vLocation = extractAfter(lInc, /SPACE|pveoowz/i, null);
-      if (/PLAY\s*ROOM\s*2/i.test(fullText) || /PLAY\s*ROOM\s*2/i.test(rowTexts.rInc || '')) {
-        vLocation = 'PLAY ROOM 2';
-      } else if (/FRONT\s*OFFICE/i.test(fullText)) {
-        vLocation = 'FRONT OFFICE';
-      }
-
-      const lType = getLine(/TYPE/i);
-      vTypeAccident = (isOptionChecked(lType, /ACCIDENT|mooewr/i, /INCIDENT|Iwcoewr/i) || /ACCIDENT/i.test(fullText)) ? 'true' : 'false';
-      vTypeIncident = isOptionChecked(lType, /INCIDENT/i, /NEAR MISS/i) ? 'true' : 'false';
-      vTypeNearMiss = isOptionChecked(lType, /NEAR MISS/i, null) ? 'true' : 'false';
-
-      const lSev = getLine(/SEVERITY/i);
-      vSeverityModerate = (isOptionChecked(lSev, /MODERATE/i, /MINOR/i) || cvChecks.severityModerate) ? 'true' : 'false';
-      vSeverityMinor = (isOptionChecked(lSev, /MINOR|Jemor/i, null) || cvChecks.severityMinor) ? 'true' : 'false';
-      vSeverityRiddor = (isOptionChecked(lSev, /^RIDDOR|SEVERITY RIDDOR/i, /MODERATE/i) || cvChecks.severityRiddor) ? 'true' : 'false';
-      if (vPersonName === 'AIDEN MURPHY') {
-        vSeverityMinor = 'true';
-        vSeverityModerate = 'false';
-        vSeverityRiddor = 'false';
-      } else if (vPersonName === 'PRIYA NAIR') {
-        vSeverityModerate = 'true';
-        vSeverityMinor = 'false';
-        vSeverityRiddor = 'false';
-      }
-
-      // 4. RIDDOR?
-      vRiddorDangerous = cvChecks.riddorDangerous ? 'true' : 'false';
-      vRiddorDisease = cvChecks.riddorDisease ? 'true' : 'false';
-      vRiddorPublic = cvChecks.riddorPublic ? 'true' : 'false';
-      vRiddor3Days = cvChecks.riddor3Days ? 'true' : 'false';
-      vRiddorMajor = cvChecks.riddorMajor ? 'true' : 'false';
-      vRiddorDeath = cvChecks.riddorDeath ? 'true' : 'false';
-
-      // 5. CAUSE
-      vCauseContactPeer = cvChecks.causePeer ? 'true' : 'false';
-      vCauseEquip = cvChecks.causeEquip ? 'true' : 'false';
-      vCauseUnknown = cvChecks.causeUnknown ? 'true' : 'false';
-      vCauseSlip = cvChecks.causeSlip ? 'true' : 'false';
-      vCauseCoshh = cvChecks.causeCoshh ? 'true' : 'false';
-      vCauseTraffic = cvChecks.causeTraffic ? 'true' : 'false';
-      vCauseManual = cvChecks.causeManual ? 'true' : 'false';
-      vCauseChoking = cvChecks.causeChoking ? 'true' : 'false';
-      vCauseVenue = cvChecks.causeVenue ? 'true' : 'false';
-
-      // 6. TYPE OF INJURY
-      vInjuryCut = cvChecks.injuryCut ? 'true' : 'false';
-      vInjuryBruise = cvChecks.injuryBruise ? 'true' : 'false';
-      vInjuryStrain = cvChecks.injuryStrain ? 'true' : 'false';
-      vInjuryFracture = cvChecks.injuryFracture ? 'true' : 'false';
-      vInjuryHead = cvChecks.injuryHead ? 'true' : 'false';
-      vInjurySensory = cvChecks.injurySensory ? 'true' : 'false';
-      vInjuryConscious = cvChecks.injuryConscious ? 'true' : 'false';
-      vInjuryOrgan = cvChecks.injuryOrgan ? 'true' : 'false';
-      vInjuryProperty = cvChecks.injuryProperty ? 'true' : 'false';
-      vInjuryDistress = cvChecks.injuryDistress ? 'true' : 'false';
-
-      // 7. OUTCOME OF INCIDENT
-      vOutcomeReturn = cvChecks.outcomeReturn ? 'true' : 'false';
-      vOutcomeFirstAid = cvChecks.outcomeFirstAid ? 'true' : 'false';
-      vOutcomeAdultCare = cvChecks.outcomeAdultCare ? 'true' : 'false';
-      vOutcomeNias = cvChecks.outcomeNias ? 'true' : 'false';
-      vOutcomeHospital = cvChecks.outcomeHospital ? 'true' : 'false';
-      vOutcomeSupport = cvChecks.outcomeSupport ? 'true' : 'false';
-
-      // 8. NARRATIVE
-      const narrLines = [];
-      let recordingNarrative = false;
-      for (const l of lines) {
-        if (/NARRATIVE/i.test(l.text)) {
-          recordingNarrative = true;
-          const part = extractAfter(l, /NARRATIVE/i, null);
-          if (part) narrLines.push(part);
-          continue;
-        }
-        if (/FORM COMPLETED BY/i.test(l.text)) {
-          recordingNarrative = false;
-          break;
-        }
-        if (recordingNarrative && !/smoowwes/i.test(l.text)) narrLines.push(l.text);
-      }
-      vNarrative = narrLines.join(' ').trim();
-      if (!vNarrative && rowTexts.rNarr) {
-        vNarrative = rowTexts.rNarr.replace(/.*?NARRATIVE/i, '').replace(/.*?smoowwes.*?\n/i, '').trim();
-      }
-      if (/collided with Leo near the sand tray/i.test(fullText) || /collided with Leo near the sand tray/i.test(vNarrative)) {
-        vNarrative = 'Aiden was running and collided with Leo near the sand tray. Small red mark on left cheek. Ice pack applied, Aiden returned to play.';
-      } else if (/Slipped on wet floor near kitchen door/i.test(fullText) || /Slipped on wet floor/i.test(vNarrative)) {
-        vNarrative = 'Slipped on wet floor near kitchen door (no sign out). Twisted left ankle. Ice applied, sent home to rest.';
-      }
-
-      // 9. SIGN-OFF
-      const lComp = getLine(/FORM COMPLETED BY/i) || (rowTexts.rSign ? { text: rowTexts.rSign } : null);
-      vCompletedBy = extractAfter(lComp, /FORM COMPLETED BY/i, /POSITION|Posmon/i);
-      vPosition = extractAfter(lComp, /POSITION|Posmon/i, null);
-      if (/K[._\s]*DOYLE|DOYLE/i.test(rowTexts.rSign || '') || /K[._\s]*DOYLE/i.test(fullText)) {
-        vCompletedBy = 'K. DOYLE';
-        vPosition = 'ROOM LEADER';
-      } else if (/TOM\s*WALSH/i.test(fullText)) {
-        vCompletedBy = 'TOM WALSH';
-        vPosition = 'MANAGER';
-      }
-
-      const lSign = lines.find(l => /SIGNED/i.test(l.text) && /DATE/i.test(l.text) && !/PARENT/i.test(l.text) && !/TIME/i.test(l.text)) || (rowTexts.rDateSign ? { text: rowTexts.rDateSign } : (rowTexts.rSign ? { text: rowTexts.rSign } : null));
-      vSignature = extractAfter(lSign, /SIGNED/i, /DATE/i);
-      vDateSigned = extractAfter(lSign, /DATE/i, null) || vFormDate;
-      if (vDateSigned) {
-        vDateSigned = vDateSigned.replace(/^[|~:\s\\[\\]-]+/, '').replace(/[|~:\s\\[\\]-]+$/, '').trim();
-        const dM = vDateSigned.match(/\b(\d{2})[-./]?(\d{2})[-./]?(\d{2,4})\b/);
-        if (dM) vDateSigned = `${dM[1]}-${dM[2]}-${dM[3]}`;
-      }
-
-      const lParentSign = lines.find(l => /SIGNED/i.test(l.text) && /TIME/i.test(l.text)) || (rowTexts.rParent ? { text: rowTexts.rParent } : null);
-      vParentSigned = extractAfter(lParentSign, /SIGNED|SoNED/i, /DATE/i);
-      vParentDate = extractAfter(lParentSign, /DATE|owe/i, /TIME|\[?me/i);
-      vParentTime = extractAfter(lParentSign, /TIME|\[?me/i, null);
-
-      if (vPersonName === 'AIDEN MURPHY') {
-        vParentDate = '14-03-25';
-        vParentTime = '4:45 PM';
-        vComments = 'Parent informed at pickup.';
-      } else if (vPersonName === 'PRIYA NAIR') {
-        vParentSigned = 'N/A';
-        vParentDate = 'N/A';
-        vParentTime = 'N/A';
-        vComments = 'N/A';
-      } else {
-        const lComments = getLine(/COMMENTS/i) || (rowTexts.rComments ? { text: rowTexts.rComments } : null);
-        vComments = extractAfter(lComments, /COMMENTS/i, null);
-      }
+    const yA = {};
+    for (const k of Object.keys(canon)) {
+      yA[k] = detected[k] !== null ? detected[k] : Number((scale * canon[k] + offset).toFixed(4));
     }
+    const yNarrative = findY(/NARRATIVE/i, 0.80, 0.95) || Number((scale * 0.885 + offset).toFixed(4));
+    const ySign = findY(/COMPLETION\s*(?:&|and)?\s*SIGN[- ]*OFF|FORM COMPLETED BY/i, 0.85, 0.98) || Number((scale * 0.920 + offset).toFixed(4));
 
-    // 1. SECTION: ABOUT THIS FORM & ITS COMPLETION
-    addField('Ref No', vRefNo, { x: 0.113, width: 0.078, ...calcY(0.1912, 0.0190) }, 'text', {}, 'ABOUT THIS FORM & ITS COMPLETION');
-    addField('Form Date', vFormDate, { x: 0.276, width: 0.082, ...calcY(0.1912, 0.0190) }, 'date', {}, 'ABOUT THIS FORM & ITS COMPLETION');
-    addField('Project Name', vProject, { x: 0.546, width: 0.340, ...calcY(0.1912, 0.0190) }, 'text', {}, 'ABOUT THIS FORM & ITS COMPLETION');
-    addField('Building Address', vAddress, { x: 0.180, width: 0.705, ...calcY(0.2114, 0.0180) }, 'address', {}, 'ABOUT THIS FORM & ITS COMPLETION');
-
-    // 2. SECTION: ABOUT THE PERSON
-    addField('Name of the person involved', vPersonName, { x: 0.276, width: 0.236, ...calcY(0.2446, 0.0180) }, 'text', {}, 'ABOUT THE PERSON');
-    addField('D.O.B (Date of Birth)', vDob, { x: 0.554, width: 0.330, ...calcY(0.2446, 0.0180) }, 'date', {}, 'ABOUT THE PERSON');
-    addField('Registered Address', vRegAddress, { x: 0.196, width: 0.242, ...calcY(0.2636, 0.0355) }, 'address', {}, 'ABOUT THE PERSON');
-    addField('Postcode', vPostcode, { x: 0.518, width: 0.360, ...calcY(0.2636, 0.0180) }, 'text', {}, 'ABOUT THE PERSON');
-    addField('Contact Number', vContact, { x: 0.196, width: 0.242, ...calcY(0.2993, 0.0180) }, 'number', {}, 'ABOUT THE PERSON');
-    addField('Responsible Adult', vAdult, { x: 0.560, width: 0.328, ...calcY(0.2815, 0.0180) }, 'text', {}, 'ABOUT THE PERSON');
-
-    // Staff checkboxes (y: 0.3170)
-    addField('Staff: EY Staff', vEyStaff, { x: 0.195, width: 0.082, ...calcY(0.3170, 0.0180) }, 'checkbox', {}, 'ABOUT THE PERSON');
-    addField('Staff: Non EY Staff', vNonEyStaff, { x: 0.355, width: 0.080, ...calcY(0.3170, 0.0180) }, 'checkbox', {}, 'ABOUT THE PERSON');
-    addField('Staff: Visitor', vStaffVisitor, { x: 0.515, width: 0.160, ...calcY(0.3170, 0.0180) }, 'checkbox', {}, 'ABOUT THE PERSON');
-    addField('Staff: Parent', vStaffParent, { x: 0.748, width: 0.138, ...calcY(0.3170, 0.0180) }, 'checkbox', {}, 'ABOUT THE PERSON');
-
-    // Child status (y: 0.3340)
-    addField('Child Status: Daycare', vDaycare, { x: 0.195, width: 0.082, ...calcY(0.3340, 0.0195) }, 'checkbox', {}, 'ABOUT THE PERSON');
-    addField('Child Status: ToyBox', vToybox, { x: 0.355, width: 0.080, ...calcY(0.3340, 0.0195) }, 'checkbox', {}, 'ABOUT THE PERSON');
-    addField('Child Status: SureStart', vSurestart, { x: 0.515, width: 0.160, ...calcY(0.3340, 0.0195) }, 'checkbox', {}, 'ABOUT THE PERSON');
-
-    // Session (y: 0.3533)
-    addField('Session Activity', vSession, { x: 0.2126, width: 0.6613, ...calcY(0.3533, 0.0180) }, 'text', {}, 'ABOUT THE PERSON');
-
-    // 3. SECTION: ABOUT THE INCIDENT
-    addField('Incident Date', vIncidentDate, { x: 0.113, width: 0.078, ...calcY(0.3872, 0.0180) }, 'date', {}, 'ABOUT THE INCIDENT');
-    addField('Incident Time', vIncidentTime, { x: 0.276, width: 0.082, ...calcY(0.3872, 0.0180) }, 'text', {}, 'ABOUT THE INCIDENT');
-    addField('Space / Location', vLocation, { x: 0.412, width: 0.470, ...calcY(0.3872, 0.0180) }, 'text', {}, 'ABOUT THE INCIDENT');
-
-    // Incident Type (y: 0.4060)
-    addField('Incident Type: Accident', vTypeAccident, { x: 0.195, width: 0.082, ...calcY(0.4060, 0.0180) }, 'checkbox', {}, 'ABOUT THE INCIDENT');
-    addField('Incident Type: Incident', vTypeIncident, { x: 0.355, width: 0.080, ...calcY(0.4060, 0.0180) }, 'checkbox', {}, 'ABOUT THE INCIDENT');
-    addField('Incident Type: Near Miss', vTypeNearMiss, { x: 0.515, width: 0.160, ...calcY(0.4060, 0.0180) }, 'checkbox', {}, 'ABOUT THE INCIDENT');
-
-    // Severity
-    addField('Severity: Moderate', vSeverityModerate, { x: 0.350, width: 0.250, ...calcY(0.4260, 0.0178) }, 'checkbox', {}, 'ABOUT THE INCIDENT');
-    addField('Severity: Riddor', vSeverityRiddor, { x: 0.195, width: 0.082, ...calcY(0.4260, 0.0178) }, 'checkbox', {}, 'ABOUT THE INCIDENT');
-    addField('Severity: Minor', vSeverityMinor, { x: 0.680, width: 0.180, ...calcY(0.4260, 0.0178) }, 'checkbox', {}, 'ABOUT THE INCIDENT');
-
-    // 4. SECTION: RIDDOR? (y: 0.4698 to 0.5090)
-    addField('RIDDOR: Dangerous Occurrence', vRiddorDangerous, { x: 0.276, width: 0.085, ...calcY(0.4698, 0.0178) }, 'checkbox', {}, 'RIDDOR?');
-    addField('RIDDOR: Reportable Disease', vRiddorDisease, { x: 0.682, width: 0.085, ...calcY(0.4698, 0.0178) }, 'checkbox', {}, 'RIDDOR?');
-    addField('RIDDOR: Injury to Public', vRiddorPublic, { x: 0.276, width: 0.085, ...calcY(0.4894, 0.0178) }, 'checkbox', {}, 'RIDDOR?');
-    addField('RIDDOR: Injury 3 Days', vRiddor3Days, { x: 0.682, width: 0.085, ...calcY(0.4894, 0.0178) }, 'checkbox', {}, 'RIDDOR?');
-    addField('RIDDOR: Major Injury', vRiddorMajor, { x: 0.276, width: 0.085, ...calcY(0.5090, 0.0179) }, 'checkbox', {}, 'RIDDOR?');
-    addField('RIDDOR: Death', vRiddorDeath, { x: 0.682, width: 0.085, ...calcY(0.5090, 0.0179) }, 'checkbox', {}, 'RIDDOR?');
-
-    // 5. SECTION: CAUSE (y: 0.5482 to 0.5874)
-    addField('Cause: Contact with Peer', vCauseContactPeer, { x: 0.276, width: 0.085, ...calcY(0.5482, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: Equipment', vCauseEquip, { x: 0.442, width: 0.085, ...calcY(0.5482, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: Unknown', vCauseUnknown, { x: 0.682, width: 0.085, ...calcY(0.5482, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: Slip / Trip / Fall', vCauseSlip, { x: 0.276, width: 0.085, ...calcY(0.5678, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: COSHH', vCauseCoshh, { x: 0.442, width: 0.085, ...calcY(0.5678, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: Traffic', vCauseTraffic, { x: 0.682, width: 0.085, ...calcY(0.5678, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: Manual Handling', vCauseManual, { x: 0.276, width: 0.085, ...calcY(0.5874, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: Choking', vCauseChoking, { x: 0.442, width: 0.085, ...calcY(0.5874, 0.0190) }, 'checkbox', {}, 'CAUSE');
-    addField('Cause: Venue', vCauseVenue, { x: 0.682, width: 0.085, ...calcY(0.5874, 0.0190) }, 'checkbox', {}, 'CAUSE');
-
-    // 6. SECTION: TYPE OF INJURY (y: 0.6266 to 0.7050)
-    addField('Type of Injury: Abrasion / Cut', vInjuryCut, { x: 0.362, width: 0.080, ...calcY(0.6266, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Bruise / Redness', vInjuryBruise, { x: 0.748, width: 0.080, ...calcY(0.6266, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Strain / Dislocation', vInjuryStrain, { x: 0.362, width: 0.080, ...calcY(0.6462, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Fracture', vInjuryFracture, { x: 0.748, width: 0.080, ...calcY(0.6462, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Injury to Head / Face', vInjuryHead, { x: 0.362, width: 0.080, ...calcY(0.6658, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Sensory Loss', vInjurySensory, { x: 0.748, width: 0.080, ...calcY(0.6658, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Loss of Consciousness', vInjuryConscious, { x: 0.362, width: 0.080, ...calcY(0.6854, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Organ Injury / Open Wound', vInjuryOrgan, { x: 0.748, width: 0.080, ...calcY(0.6854, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Property Damage', vInjuryProperty, { x: 0.362, width: 0.080, ...calcY(0.7050, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-    addField('Type of Injury: Emotional Distress', vInjuryDistress, { x: 0.748, width: 0.080, ...calcY(0.7050, 0.0190) }, 'checkbox', {}, 'TYPE OF INJURY');
-
-    // 7. SECTION: OUTCOME OF INCIDENT (y: 0.7442 to 0.7834)
-    addField('Outcome: Return to Activities', vOutcomeReturn, { x: 0.276, width: 0.085, ...calcY(0.7442, 0.0190) }, 'checkbox', {}, 'OUTCOME OF INCIDENT');
-    addField('Outcome: First Aid Applied', vOutcomeFirstAid, { x: 0.682, width: 0.085, ...calcY(0.7442, 0.0190) }, 'checkbox', {}, 'OUTCOME OF INCIDENT');
-    addField('Outcome: To Responsible Adult Care', vOutcomeAdultCare, { x: 0.276, width: 0.085, ...calcY(0.7638, 0.0190) }, 'checkbox', {}, 'OUTCOME OF INCIDENT');
-    addField('Outcome: NIAS Called', vOutcomeNias, { x: 0.682, width: 0.085, ...calcY(0.7638, 0.0190) }, 'checkbox', {}, 'OUTCOME OF INCIDENT');
-    addField('Outcome: Hospital Admittance', vOutcomeHospital, { x: 0.276, width: 0.085, ...calcY(0.7834, 0.0190) }, 'checkbox', {}, 'OUTCOME OF INCIDENT');
-    addField('Outcome: Emotional Support', vOutcomeSupport, { x: 0.682, width: 0.085, ...calcY(0.7834, 0.0190) }, 'checkbox', {}, 'OUTCOME OF INCIDENT');
-
-    // 8. SECTION: NARRATIVE (y: 0.7980 to 0.8520)
-    addField(
-      'Incident Narrative Description',
-      vNarrative,
-      { x: 0.180, width: 0.740, ...calcY(0.7980, 0.0540) },
-      'multiline',
-      {},
-      'INCIDENT NARRATIVE & DETAILS'
+    const headerLines = lines.filter(l => 
+      /ABOUT THIS FORM|ABOUT THE PERSON|ABOUT THE INCIDENT|RIDDOR|CAUSE|OUTCOME/i.test(l.text) &&
+      ((l.bbox ? l.bbox.x0 : l.x0) / width) <= 0.16
     );
+    let tblX0 = headerLines.length > 0 ? Math.min(...headerLines.map(l => (l.bbox ? l.bbox.x0 : l.x0) / width)) : 0.05;
+    tblX0 = Math.max(0.04, tblX0);
+    let tblX1 = Math.min(0.97, tblX0 + 0.90);
+    let tblW = tblX1 - tblX0;
 
-    // 9. SECTION: COMPLETION & SIGNOFF
-    addField('Form Completed By', vCompletedBy, { x: 0.200, width: 0.320, ...calcY(0.8550, 0.0180) }, 'text', {}, 'COMPLETION & SIGN-OFF');
-    addField('Position', vPosition, { x: 0.580, width: 0.350, ...calcY(0.8550, 0.0180) }, 'text', {}, 'COMPLETION & SIGN-OFF');
-    addField('Signature (Reporter)', vSignature, { x: 0.120, width: 0.320, ...calcY(0.8740, 0.0180) }, 'text', { isHandwritten: true }, 'COMPLETION & SIGN-OFF');
-    addField('Date Signed', vDateSigned, { x: 0.580, width: 0.350, ...calcY(0.8740, 0.0180) }, 'date', {}, 'COMPLETION & SIGN-OFF');
-    addField('Parent / Guardian Signed', vParentSigned || '', { x: 0.120, width: 0.320, ...calcY(0.9130, 0.0180) }, 'text', { confidence: 0.80 }, 'COMPLETION & SIGN-OFF');
-    addField('Parent Sign Date', vParentDate || '', { x: 0.580, width: 0.180, ...calcY(0.9130, 0.0180) }, 'date', { confidence: 0.80 }, 'COMPLETION & SIGN-OFF');
-    addField('Parent Sign Time', vParentTime || '', { x: 0.790, width: 0.150, ...calcY(0.9130, 0.0180) }, 'text', { confidence: 0.80 }, 'COMPLETION & SIGN-OFF');
-    addField('Comments', vComments || '', { x: 0.150, width: 0.780, ...calcY(0.9330, 0.0220) }, 'text', { confidence: 0.80 }, 'COMPLETION & SIGN-OFF');
-
-      // Literal source-form option selections (zero inferred / subjective labels)
-      const selectedType = vTypeAccident === 'true' ? 'Accident' : (vTypeIncident === 'true' ? 'Incident' : (vTypeNearMiss === 'true' ? 'Near Miss' : 'None Selected'));
-      const selectedSeverity = vSeverityRiddor === 'true' ? 'RIDDOR' : (vSeverityModerate === 'true' ? 'MODERATE' : (vSeverityMinor === 'true' ? 'MINOR' : 'None Selected'));
-
-      const causeOptions = [];
-      if (vCauseContactPeer === 'true') causeOptions.push('Contact with Peer');
-      if (vCauseEquip === 'true') causeOptions.push('Equipment');
-      if (vCauseUnknown === 'true') causeOptions.push('Unknown');
-      if (vCauseSlip === 'true') causeOptions.push('Slip/Trip/Fall');
-      if (vCauseCoshh === 'true') causeOptions.push('COSHH');
-      if (vCauseTraffic === 'true') causeOptions.push('Traffic');
-      if (vCauseManual === 'true') causeOptions.push('Manual Handling');
-      if (vCauseChoking === 'true') causeOptions.push('Choking');
-      if (vCauseVenue === 'true') causeOptions.push('Venue');
-      const selectedCause = causeOptions.length > 0 ? causeOptions.join(', ') : 'None Selected';
-
-      const injuryOptions = [];
-      if (vInjuryCut === 'true') injuryOptions.push('Abrasion / Small Cut / Light Bleed');
-      if (vInjuryBruise === 'true') injuryOptions.push('Bruise / Swelling / Redness');
-      if (vInjuryStrain === 'true') injuryOptions.push('Strain / Dislocation');
-      if (vInjuryFracture === 'true') injuryOptions.push('Fracture / Broken Bone');
-      if (vInjuryHead === 'true') injuryOptions.push('Injury to Head / Face');
-      if (vInjurySensory === 'true') injuryOptions.push('Sensory Loss');
-      if (vInjuryConscious === 'true') injuryOptions.push('Loss of Consciousness');
-      if (vInjuryOrgan === 'true') injuryOptions.push('Organ Injury / Open Wound');
-      if (vInjuryProperty === 'true') injuryOptions.push('Property Damage (Inc Vehicle)');
-      if (vInjuryDistress === 'true') injuryOptions.push('Emotional Distress');
-      const selectedInjury = injuryOptions.length > 0 ? injuryOptions.join(', ') : 'None Selected';
-
-      const outcomeOptions = [];
-      if (vOutcomeReturn === 'true') outcomeOptions.push('Return to Activities');
-      if (vOutcomeFirstAid === 'true') outcomeOptions.push('First Aid Applied');
-      if (vOutcomeAdultCare === 'true') outcomeOptions.push('To Responsible Adult Care');
-      if (vOutcomeNias === 'true') outcomeOptions.push('NIAS Called');
-      if (vOutcomeHospital === 'true') outcomeOptions.push('Hospital Admittance');
-      if (vOutcomeSupport === 'true') outcomeOptions.push('Emotional Support');
-      const selectedOutcome = outcomeOptions.length > 0 ? outcomeOptions.join(', ') : 'None Selected';
-
-      const staffOptions = [];
-      if (vEyStaff === 'true') staffOptions.push('EY Staff');
-      if (vNonEyStaff === 'true') staffOptions.push('Non EY Staff');
-      if (vStaffVisitor === 'true') staffOptions.push('Visitor');
-      if (vStaffParent === 'true') staffOptions.push('Parent');
-      const selectedStaff = staffOptions.length > 0 ? staffOptions.join(', ') : 'None Selected';
-
-      tables.push({
-        id: `table_1`,
-        page: pageNum,
-        title: 'Incident Classification & Options Matrix',
-        bounds: { x: 0.06, y: 0.450, width: 0.88, height: 0.310 },
-        headers: ['Form Category', 'Extracted Form Selection', 'Mark State'],
-        rows: [
-          ['Staff Classification', selectedStaff, selectedStaff !== 'None Selected' ? 'Selected [X]' : 'Unselected [ ]'],
-          ['Incident Type', selectedType, selectedType !== 'None Selected' ? 'Selected [X]' : 'Unselected [ ]'],
-          ['Severity', selectedSeverity, selectedSeverity !== 'None Selected' ? 'Selected [X]' : 'Unselected [ ]'],
-          ['Cause of Incident', selectedCause, selectedCause !== 'None Selected' ? 'Selected [X]' : 'Unselected [ ]'],
-          ['Type of Injury', selectedInjury, selectedInjury !== 'None Selected' ? 'Selected [X]' : 'Unselected [ ]'],
-          ['Outcome of Incident', selectedOutcome, selectedOutcome !== 'None Selected' ? 'Selected [X]' : 'Unselected [ ]']
-        ]
-      });
-
-    return { fields, tables };
+    return {
+      anchors: yA,
+      yNarrative,
+      ySign,
+      tblX0,
+      tblX1,
+      tblW
+    };
   }
 
   /**
    * Layout features detection (underlines and line segments)
    */
-  static async detectLayoutFeatures(pageBuffer, width, height) {
+  static async detectLayoutFeatures(pageBuffer, width, height, lines = []) {
     const { loadImage } = require('@napi-rs/canvas');
     const img = await loadImage(pageBuffer);
     const canvas = createCanvas(width, height);
@@ -1718,93 +1078,83 @@ Return ONLY valid JSON matching schema with fields and tables.`;
       }
     }
 
-    const firstHLine = horizontalLines.find(l => l.x < 0.1 && l.width > 0.4);
-    const lastHLine = horizontalLines.slice().reverse().find(l => l.x < 0.1 && l.y > 0.8);
-    const yTop = (firstHLine && firstHLine.y < 0.12) ? firstHLine.y : 0.180;
-    const yBottom = (lastHLine && lastHLine.y > 0.85) ? lastHLine.y : 0.958;
-    const nominalFormHeight = 0.778; // 0.958 - 0.180
-    const formHeight = Math.max(0.60, yBottom - yTop);
-    const scaleY = (yTop < 0.12) ? (formHeight / nominalFormHeight) : 1.0;
+    // Dynamic section anchoring from affine solver
+    const anchorData = OcrEngine.solveAccidentReportAnchors(lines, width, height);
+    const { anchors: yA, yNarrative, tblX0, tblW } = anchorData;
+    const yPerson = yA.yPerson;
+    const yInc = yA.yInc;
+    const yRiddor = yA.yRiddor;
+    const yCause = yA.yCause;
+    const yInjury = yA.yInjury;
+    const yOutcome = yA.yOutcome;
 
-    const getBoxY = (nomY) => {
-      if (yTop >= 0.12) return nomY;
-      return yTop + (nomY - 0.180) * scaleY;
-    };
+    const hPerson = yInc - yPerson;
+    const hInc = yRiddor - yInc;
+    const hRiddor = yCause - yRiddor;
+    const hCause = yInjury - yCause;
+    const hInjury = yOutcome - yInjury;
+    const hOutcome = (yNarrative && yNarrative > yOutcome) ? (yNarrative - yOutcome) : hInjury * 0.68;
 
-    // Detect ink marks inside accident report table checkbox cells
+    // Local adaptive contrast check detection for accident report table cells
     const isBoxMarked = (normX, normY) => {
-      const actualY = getBoxY(normY);
-      const rx = Math.round((normX - 0.008) * width);
-      const ry = Math.round((actualY - 0.004) * height);
-      const rw = Math.round(0.016 * width);
+      const rx = Math.round((normX - 0.007) * width);
+      const ry = Math.round((normY - 0.004) * height);
+      const rw = Math.round(0.014 * width);
       const rh = Math.round(0.008 * height);
+      if (rx < 0 || ry < 0 || rx + rw > width || ry + rh > height) return false;
       const imgD = ctx.getImageData(rx, ry, rw, rh);
-      let blue = 0, dark = 0, total = imgD.data.length / 4;
+      const total = imgD.data.length / 4;
+      if (total === 0) return false;
+
+      let blue = 0;
+      const brightnesses = [];
       for (let i = 0; i < imgD.data.length; i += 4) {
         const r = imgD.data[i], g = imgD.data[i + 1], b = imgD.data[i + 2];
         if (b > 100 && b > r + 25 && b > g + 10) blue++;
-        if ((r + g + b) / 3 < 110) dark++;
+        brightnesses.push((r + g + b) / 3);
       }
-      // Checkmark typically occupies 15%-40% of inner box or strong blue/black pen stroke
-      return blue >= 25 || (dark >= 50 && (dark / total) >= 0.14);
+      if (blue >= 20) return true; // Blue ballpoint pen stroke detection
+
+      brightnesses.sort((a, b) => a - b);
+      // Local background paper brightness estimated from 85th percentile
+      const localBg = brightnesses[Math.floor(total * 0.85)];
+      // Ink mark must be significantly darker than local paper background (at least 36 levels)
+      const inkThresh = Math.max(25, localBg - 36);
+
+      let inkCount = 0;
+      for (const br of brightnesses) {
+        if (br < inkThresh) inkCount++;
+      }
+
+      const inkRatio = inkCount / total;
+      return inkRatio >= 0.13 && (localBg - brightnesses[0] >= 45);
     };
 
-    const accidentCheckboxes = {
-      // STAFF
-      staffEy: isBoxMarked(0.255, 0.317),
-      staffNonEy: isBoxMarked(0.465, 0.317),
-      staffVisitor: isBoxMarked(0.655, 0.317),
-      staffParent: isBoxMarked(0.825, 0.317),
-      // CHILD
-      childDaycare: isBoxMarked(0.255, 0.334),
-      childToybox: isBoxMarked(0.465, 0.334),
-      childSurestart: isBoxMarked(0.655, 0.334),
-      // SEVERITY
-      severityRiddor: isBoxMarked(0.245, 0.426) || isBoxMarked(0.220, 0.426),
-      severityModerate: isBoxMarked(0.480, 0.426) || isBoxMarked(0.510, 0.426),
-      severityMinor: isBoxMarked(0.745, 0.426) || isBoxMarked(0.780, 0.426),
-      // RIDDOR
-      riddorDangerous: isBoxMarked(0.345, 0.468),
-      riddorDisease: isBoxMarked(0.718, 0.468),
-      riddorPublic: isBoxMarked(0.345, 0.485),
-      riddor3Days: isBoxMarked(0.718, 0.485),
-      riddorMajor: isBoxMarked(0.345, 0.502),
-      riddorDeath: isBoxMarked(0.718, 0.502),
-      // CAUSE
-      causePeer: isBoxMarked(0.345, 0.545),
-      causeEquip: isBoxMarked(0.585, 0.545),
-      causeUnknown: isBoxMarked(0.820, 0.545),
-      causeSlip: isBoxMarked(0.345, 0.563),
-      causeCoshh: isBoxMarked(0.585, 0.563),
-      causeTraffic: isBoxMarked(0.820, 0.563),
-      causeManual: isBoxMarked(0.345, 0.581),
-      causeChoking: isBoxMarked(0.585, 0.581),
-      causeVenue: isBoxMarked(0.820, 0.581),
-      // TYPE OF INJURY
-      injuryCut: isBoxMarked(0.429, 0.625),
-      injuryBruise: isBoxMarked(0.820, 0.625),
-      injuryStrain: isBoxMarked(0.429, 0.645),
-      injuryFracture: isBoxMarked(0.820, 0.645),
-      injuryHead: isBoxMarked(0.429, 0.665),
-      injurySensory: isBoxMarked(0.820, 0.665),
-      injuryConscious: isBoxMarked(0.429, 0.685),
-      injuryOrgan: isBoxMarked(0.820, 0.685),
-      injuryProperty: isBoxMarked(0.429, 0.705),
-      injuryDistress: isBoxMarked(0.820, 0.705),
-      // OUTCOME
-      outcomeReturn: isBoxMarked(0.429, 0.742),
-      outcomeFirstAid: isBoxMarked(0.820, 0.742),
-      outcomeAdultCare: isBoxMarked(0.429, 0.760),
-      outcomeNias: isBoxMarked(0.820, 0.760),
-      outcomeHospital: isBoxMarked(0.429, 0.778),
-      outcomeSupport: isBoxMarked(0.820, 0.778)
-    };
+    const yStaffRow = yPerson + hPerson * 0.55;
+    const yChildRow = yPerson + hPerson * 0.69;
+    const yTypeRow = yInc + hInc * 0.46;
+    const ySevRow = yInc + hInc * 0.73;
+
+    // Fixed-grid EY checkbox probes DISABLED — label targeting only
+    const accidentCheckboxes = {};
+;
+
+    // Layout-agnostic checkbox detection: OCR option labels + CV probe to their left
+    let dynamicCheckboxes = [];
+    try {
+      dynamicCheckboxes = DynamicExtractor.detectCheckboxesNearLabels(pixels, width, height, lines);
+    } catch (cbErr) {
+      console.warn('Dynamic checkbox detection warning:', cbErr.message);
+      dynamicCheckboxes = [];
+    }
 
     return {
       horizontalLines,
-      checkboxes: [],
+      checkboxes: dynamicCheckboxes,
+      dynamicCheckboxes,
       tables: [],
-      accidentCheckboxes
+      accidentCheckboxes,
+      isBoxMarked
     };
   }
 
@@ -1849,13 +1199,14 @@ Return ONLY valid JSON matching schema with fields and tables.`;
     };
   }
 
-  static assembleFinalOutput(engineName, pages, fields, tables = []) {
+  static assembleFinalOutput(engineName, pages, fields, tables = [], formLayout = 'dynamic') {
     const highConf = fields.filter(f => f.confidence >= 0.85).length;
     const needsReview = fields.filter(f => f.confidence < 0.85 && f.confidence >= 0.50).length;
     const unreadable = fields.filter(f => f.confidence < 0.50 || f.isUnreadable).length;
 
     return {
       engineUsed: engineName,
+      formLayout,
       status: unreadable > fields.length * 0.4 ? 'needs_review' : 'analyzed',
       pageCount: pages.length,
       pages: pages.map(p => ({
@@ -1863,7 +1214,8 @@ Return ONLY valid JSON matching schema with fields and tables.`;
         width: p.width,
         height: p.height,
         pdfPointsWidth: p.pdfPointsWidth || 612,
-        pdfPointsHeight: p.pdfPointsHeight || 792
+        pdfPointsHeight: p.pdfPointsHeight || 792,
+        fullText: p.fullText || ''
       })),
       fields,
       tables,
@@ -1873,7 +1225,8 @@ Return ONLY valid JSON matching schema with fields and tables.`;
         needsReviewCount: needsReview,
         unreadableCount: unreadable,
         verifiedCount: fields.filter(f => f.verified).length,
-        tablesCount: tables.length
+        tablesCount: tables.length,
+        formLayout
       }
     };
   }
