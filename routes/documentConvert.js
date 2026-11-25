@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const dotenv = require('dotenv');
 
 const ImagePreprocessor = require('../services/imagePreprocessor');
 const OcrEngine = require('../services/ocrEngine');
@@ -21,32 +22,49 @@ const AccidentReportPdfGenerator = require('../services/accidentReportPdfGenerat
 function isEarlyYearsAccidentDoc(doc) {
   if (!doc) return false;
   if (doc.formLayout === 'early_years_accident') return true;
+  if (doc.documentType === 'early_years_accident') return true;
   if (doc.formLayout === 'dynamic') return false;
   const labels = (doc.fields || []).map(f => f.label || '').join(' ');
-  return /riddor|ey staff|toybox|surestart|name of the person involved/i.test(labels);
+  const hasEyTitle = /accident\s*&\s*incident/i.test(labels);
+  const hasEySpecific = /riddor|toybox|surestart/i.test(labels);
+  return hasEyTitle && hasEySpecific;
 }
 
 function isAccidentDoc(doc) {
   return isEarlyYearsAccidentDoc(doc);
 }
 
-// Setup storage directories
+// Legacy runtime directories — automatically purged on startup; never persisted to.
 const UPLOADS_DIR = path.join(__dirname, '..', 'storage', 'uploads');
 const PROCESSED_DIR = path.join(__dirname, '..', 'storage', 'processed');
 
+function purgeDirectoryContents(dirPath) {
+  if (!fs.existsSync(dirPath)) return 0;
+  let removed = 0;
+  for (const entry of fs.readdirSync(dirPath)) {
+    if (entry === '.gitkeep') continue;
+    const fullPath = path.join(dirPath, entry);
+    try {
+      fs.rmSync(fullPath, { recursive: true, force: true });
+      removed++;
+    } catch (err) {
+      console.warn(`Could not remove stale file ${fullPath}:`, err.message);
+    }
+  }
+  return removed;
+}
+
+// Purge any historical uploaded images or processed JSON artifacts from disk immediately
 [UPLOADS_DIR, PROCESSED_DIR].forEach(dir => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
-
-// Configure Multer
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const uniqueSuffix = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    cb(null, `${uniqueSuffix}_${safeName}`);
+  const count = purgeDirectoryContents(dir);
+  if (count > 0) {
+    console.log(`[Security Cleanup] Purged ${count} old file(s) from ${path.basename(dir)}/`);
   }
 });
+
+// Zero-disk-storage Multer: hold uploaded file in memory only during active processing
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,
@@ -65,72 +83,120 @@ const upload = multer({
   }
 });
 
-// In-memory document session cache
+// Strictly ephemeral in-memory session cache (never written to disk locally or in production)
 const documentsMap = new Map();
 
+const ENV_FILE_PATH = path.join(__dirname, '..', '.env');
+let lastEnvMtimeMs = 0;
+let managedEnvKeys = new Set();
+
+try {
+  if (fs.existsSync(ENV_FILE_PATH)) {
+    const stat = fs.statSync(ENV_FILE_PATH);
+    lastEnvMtimeMs = stat.mtimeMs;
+    const parsed = dotenv.parse(fs.readFileSync(ENV_FILE_PATH));
+    managedEnvKeys = new Set(Object.keys(parsed));
+  }
+} catch (_) { /* ignore */ }
+
 /**
- * Save document session to memory and disk
+ * Hot-reload .env changes if .env is edited at runtime without requiring server restart
  */
-function saveDocumentState(doc) {
-  documentsMap.set(doc.id, doc);
+function syncEnvFromFile() {
   try {
-    const metaPath = path.join(PROCESSED_DIR, `${doc.id}.json`);
-    // Save metadata without large page buffers
-    const meta = {
-      ...doc,
-      pages: (doc.pages || []).map(p => ({
-        pageNumber: p.pageNumber,
-        width: p.width,
-        height: p.height,
-        pdfPointsWidth: p.pdfPointsWidth,
-        pdfPointsHeight: p.pdfPointsHeight,
-        originalType: p.originalType,
-        textItems: p.textItems || [],
-        fullText: p.fullText || ''
-      }))
-    };
-    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    if (!fs.existsSync(ENV_FILE_PATH)) return;
+    const stat = fs.statSync(ENV_FILE_PATH);
+    if (stat.mtimeMs === lastEnvMtimeMs) return;
+    lastEnvMtimeMs = stat.mtimeMs;
+    const parsed = dotenv.parse(fs.readFileSync(ENV_FILE_PATH));
+    for (const oldKey of managedEnvKeys) {
+      if (!(oldKey in parsed)) {
+        delete process.env[oldKey];
+      }
+    }
+    for (const [k, v] of Object.entries(parsed)) {
+      process.env[k] = v;
+    }
+    managedEnvKeys = new Set(Object.keys(parsed));
   } catch (err) {
-    console.error('Failed to write document metadata to disk:', err.message);
+    console.warn('Could not reload .env:', err.message);
   }
 }
 
+function getDocumentTtlMs() {
+  const mins = Math.max(1, parseInt(process.env.DOCUMENT_TTL_MINUTES || '15', 10) || 15);
+  return mins * 60 * 1000;
+}
+
+function setNoStoreHeaders(res) {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+}
+
 /**
- * Helper to get document or throw 404 (persisted across restarts)
+ * Update ephemeral in-memory document session (zero disk persistence)
+ */
+function saveDocumentState(doc) {
+  if (!doc || !doc.id) return;
+  doc.lastAccessedAt = Date.now();
+  documentsMap.set(doc.id, doc);
+}
+
+/**
+ * Permanently wipe a document and its image buffers from memory
+ */
+function purgeDocument(id) {
+  if (!id) return false;
+  const doc = documentsMap.get(id);
+  let existed = false;
+  if (doc) {
+    existed = true;
+    for (const p of doc.pages || []) {
+      if (Buffer.isBuffer(p.buffer)) {
+        p.buffer.fill(0);
+      }
+      p.buffer = null;
+      if (Buffer.isBuffer(p.pageBuffer)) {
+        p.pageBuffer.fill(0);
+      }
+      p.pageBuffer = null;
+      p.textItems = null;
+      p.fullText = null;
+    }
+    doc.pages = [];
+    doc.fields = [];
+    doc.tables = [];
+    documentsMap.delete(id);
+  }
+  const staleMeta = path.join(PROCESSED_DIR, `${id}.json`);
+  if (fs.existsSync(staleMeta)) {
+    try { fs.unlinkSync(staleMeta); existed = true; } catch (_) { /* ignore */ }
+  }
+  return existed;
+}
+
+// Auto-expire inactive in-memory sessions every 2 minutes (.unref() keeps CLI/test exit clean)
+setInterval(() => {
+  syncEnvFromFile();
+  const cutoff = Date.now() - getDocumentTtlMs();
+  for (const [id, doc] of documentsMap.entries()) {
+    if ((doc.lastAccessedAt || 0) < cutoff) {
+      purgeDocument(id);
+    }
+  }
+}, 2 * 60 * 1000).unref();
+
+/**
+ * Helper to get ephemeral document from memory or return 404
  */
 async function getDocumentOr404(id, res) {
-  let doc = documentsMap.get(id);
+  const doc = documentsMap.get(id);
   if (!doc) {
-    const metaPath = path.join(PROCESSED_DIR, `${id}.json`);
-    if (fs.existsSync(metaPath)) {
-      try {
-        const raw = fs.readFileSync(metaPath, 'utf8');
-        doc = JSON.parse(raw);
-        documentsMap.set(id, doc);
-      } catch (e) {
-        console.error(`Failed to read doc ${id} from disk:`, e);
-      }
-    }
-  }
-
-  if (!doc) {
-    res.status(404).json({ error: `Document with ID ${id} not found.` });
+    res.status(404).json({ error: `Document session ${id} expired or was removed. Please re-upload.` });
     return null;
   }
-
-  // Ensure page buffers are loaded if missing (needed for page rendering, PDF reconstruction and exports)
-  if (!doc.pages || doc.pages.length === 0 || (!doc.pages[0].buffer && !doc.pages[0].pageBuffer)) {
-    if (doc.originalPath && fs.existsSync(doc.originalPath)) {
-      try {
-        const freshPages = await ImagePreprocessor.extractPages(doc.originalPath, doc.mimeType);
-        doc.pages = freshPages;
-        documentsMap.set(id, doc);
-      } catch (err) {
-        console.warn(`Could not re-extract pages for ${id}:`, err.message);
-      }
-    }
-  }
-
+  doc.lastAccessedAt = Date.now();
   return doc;
 }
 
@@ -138,6 +204,7 @@ async function getDocumentOr404(id, res) {
 // 1. Check System Providers Status
 // ----------------------------------------------------------------------------
 router.get('/status', (req, res) => {
+  syncEnvFromFile();
   res.json({
     status: 'online',
     version: '1.0.0',
@@ -146,6 +213,11 @@ router.get('/status', (req, res) => {
         available: true,
         name: 'FormFlow Smart Local Engine (Sharp + Tesseract + CV)',
         readyWithoutKey: true
+      },
+      aws: {
+        available: !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY),
+        name: 'AWS Textract (Forms, Tables & Handwriting)',
+        configured: !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
       },
       azure: {
         available: !!(process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY && process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT),
@@ -167,26 +239,30 @@ router.get('/status', (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// 2. Upload Document
+// 2. Upload Document (Memory-Only — Zero Disk Retention)
 // ----------------------------------------------------------------------------
 router.post('/upload', upload.single('document'), async (req, res) => {
   try {
-    if (!req.file) {
+    if (!req.file || !req.file.buffer) {
       return res.status(400).json({ error: 'No document file uploaded.' });
     }
 
+    if (req.body?.previousDocId) {
+      purgeDocument(req.body.previousDocId);
+    }
+
     const docId = `doc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    const filePath = req.file.path;
     const mimeType = req.file.mimetype;
 
-    // Extract pages and render previews
-    const pages = await ImagePreprocessor.extractPages(filePath, mimeType);
+    // Extract pages purely from in-memory Buffer — never write user file to disk
+    const pages = await ImagePreprocessor.extractPages(req.file.buffer, mimeType);
+    req.file.buffer.fill(0);
+    req.file.buffer = null;
 
     const doc = {
       id: docId,
       filename: req.file.originalname,
       mimeType,
-      originalPath: filePath,
       pageCount: pages.length,
       pages,
       fields: [],
@@ -203,6 +279,7 @@ router.post('/upload', upload.single('document'), async (req, res) => {
     };
 
     saveDocumentState(doc);
+    setNoStoreHeaders(res);
 
     res.json({
       success: true,
@@ -229,6 +306,7 @@ router.post('/upload', upload.single('document'), async (req, res) => {
 // ----------------------------------------------------------------------------
 router.post('/analyze/:id', async (req, res) => {
   try {
+    syncEnvFromFile();
     const doc = await getDocumentOr404(req.params.id, res);
     if (!doc) return;
 
@@ -239,7 +317,10 @@ router.post('/analyze/:id', async (req, res) => {
       geminiKey = null,
       openaiKey = null,
       azureKey = null,
-      azureEndpoint = null
+      azureEndpoint = null,
+      awsAccessKey = null,
+      awsSecretKey = null,
+      awsRegion = null
     } = req.body || {};
 
     const analysisResult = await OcrEngine.analyzeDocument(doc.pages, {
@@ -249,7 +330,10 @@ router.post('/analyze/:id', async (req, res) => {
       geminiKey,
       openaiKey,
       azureKey,
-      azureEndpoint
+      azureEndpoint,
+      awsAccessKey,
+      awsSecretKey,
+      awsRegion
     });
 
     // Update document record
@@ -270,6 +354,7 @@ router.post('/analyze/:id', async (req, res) => {
     }
 
     saveDocumentState(doc);
+    setNoStoreHeaders(res);
 
     res.json({
       success: true,
@@ -303,6 +388,7 @@ router.get('/document/:id', async (req, res) => {
   const doc = await getDocumentOr404(req.params.id, res);
   if (!doc) return;
 
+  setNoStoreHeaders(res);
   res.json({
     document: {
       id: doc.id,
@@ -324,7 +410,22 @@ router.get('/document/:id', async (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// 5. Get Page Image (High-Res PNG)
+// 4b. Immediate Session Removal (Delete Uploaded Image & Extracted Data)
+// ----------------------------------------------------------------------------
+router.delete('/document/:id', (req, res) => {
+  const purged = purgeDocument(req.params.id);
+  setNoStoreHeaders(res);
+  res.json({ success: true, purged });
+});
+
+router.post('/document/:id/purge', (req, res) => {
+  const purged = purgeDocument(req.params.id);
+  setNoStoreHeaders(res);
+  res.json({ success: true, purged });
+});
+
+// ----------------------------------------------------------------------------
+// 5. Get Page Image (Ephemeral, Never Cached)
 // ----------------------------------------------------------------------------
 router.get('/page/:id/:pageNumber', async (req, res) => {
   const doc = await getDocumentOr404(req.params.id, res);
@@ -338,7 +439,7 @@ router.get('/page/:id/:pageNumber', async (req, res) => {
   }
 
   res.setHeader('Content-Type', 'image/png');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
+  setNoStoreHeaders(res);
   res.send(page.buffer);
 });
 
@@ -350,13 +451,6 @@ router.get('/reconstructed-page/:id/:pageNumber', async (req, res) => {
     const doc = await getDocumentOr404(req.params.id, res);
     if (!doc) return;
 
-    const pageNum = parseInt(req.params.pageNumber, 10) || 1;
-    const page = doc.pages.find(p => p.pageNumber === pageNum) || doc.pages[0];
-
-    if (!page || !page.buffer) {
-      return res.status(404).json({ error: `Page ${pageNum} not available` });
-    }
-
     if (isAccidentDoc(doc)) {
       const generated = await AccidentReportPdfGenerator.generate(doc);
       if (generated.previewPng) {
@@ -366,6 +460,13 @@ router.get('/reconstructed-page/:id/:pageNumber', async (req, res) => {
         res.setHeader('Expires', '0');
         return res.send(generated.previewPng);
       }
+    }
+
+    const pageNum = parseInt(req.params.pageNumber, 10) || 1;
+    const page = doc.pages.find(p => p.pageNumber === pageNum) || doc.pages[0];
+
+    if (!page || !page.buffer) {
+      return res.status(404).json({ error: `Page ${pageNum} not available` });
     }
 
     const reconstruction = await PdfReconstructor.reconstruct([page], doc.fields || [], { fontName: 'Helvetica' });
@@ -380,6 +481,7 @@ router.get('/reconstructed-page/:id/:pageNumber', async (req, res) => {
     }
 
     res.setHeader('Content-Type', 'image/png');
+    setNoStoreHeaders(res);
     res.send(page.buffer);
   } catch (err) {
     console.error('Reconstructed page preview error:', err);
@@ -454,6 +556,7 @@ router.all('/export/pdf/:id', async (req, res) => {
     const doc = await getDocumentOr404(req.params.id, res);
     if (!doc) return;
 
+    setNoStoreHeaders(res);
     const fieldsToUse = Array.isArray(req.body?.fields) ? req.body.fields : doc.fields;
     const safeBaseName = doc.filename.replace(/\.[^/.]+$/, '');
 
@@ -483,6 +586,7 @@ router.all('/preview/pdf/:id', async (req, res) => {
     const doc = await getDocumentOr404(req.params.id, res);
     if (!doc) return;
 
+    setNoStoreHeaders(res);
     const fieldsToUse = Array.isArray(req.body?.fields) ? req.body.fields : doc.fields;
 
     if (isAccidentDoc(doc)) {
@@ -514,6 +618,7 @@ router.all('/export/word/:id', async (req, res) => {
     const doc = await getDocumentOr404(req.params.id, res);
     if (!doc) return;
 
+    setNoStoreHeaders(res);
     const fieldsToUse = Array.isArray(req.body?.fields) ? req.body.fields : doc.fields;
     const tablesToUse = Array.isArray(req.body?.tables) ? req.body.tables : (doc.tables || []);
     const docxBuffer = await WordExporter.generateDocx({ ...doc, fields: fieldsToUse, tables: tablesToUse });
@@ -536,6 +641,7 @@ router.all('/export/excel/:id', async (req, res) => {
     const doc = await getDocumentOr404(req.params.id, res);
     if (!doc) return;
 
+    setNoStoreHeaders(res);
     const fieldsToUse = Array.isArray(req.body?.fields) ? req.body.fields : doc.fields;
     const tablesToUse = Array.isArray(req.body?.tables) ? req.body.tables : (doc.tables || []);
     const excelBuffer = await ExcelExporter.generateExcel({ ...doc, fields: fieldsToUse, tables: tablesToUse });
@@ -557,6 +663,7 @@ router.all('/export/json/:id', async (req, res) => {
   const doc = await getDocumentOr404(req.params.id, res);
   if (!doc) return;
 
+  setNoStoreHeaders(res);
   const fieldsToUse = Array.isArray(req.body?.fields) ? req.body.fields : doc.fields;
   const jsonData = JsonExporter.formatJson({ ...doc, fields: fieldsToUse });
   const safeBaseName = doc.filename.replace(/\.[^/.]+$/, '');
@@ -680,6 +787,7 @@ router.post('/load-sample/:sampleId', async (req, res) => {
     doc.extractedAt = new Date().toISOString();
 
     saveDocumentState(doc);
+    setNoStoreHeaders(res);
 
     res.json({
       success: true,

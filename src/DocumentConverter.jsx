@@ -212,6 +212,44 @@ export default function DocumentConverter() {
   const imageRef = useRef(null);
   const fieldsContainerRef = useRef(null);
   const fileInputRef = useRef(null);
+  const syncTimeoutRef = useRef(null);
+  const activeDocIdRef = useRef(null);
+
+  const purgeRemoteDocument = (docId, useBeacon = false) => {
+    if (!docId) return;
+    const purgeUrl = `${API_BASE}/document/${docId}/purge`;
+    if (useBeacon && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      try {
+        navigator.sendBeacon(purgeUrl);
+        return;
+      } catch {
+        // Fallback to keepalive fetch
+      }
+    }
+    fetch(`${API_BASE}/document/${docId}`, {
+      method: 'DELETE',
+      keepalive: true
+    }).catch(() => {});
+  };
+
+  useEffect(() => {
+    activeDocIdRef.current = doc?.id || null;
+  }, [doc?.id]);
+
+  // Ensure uploaded image & extracted data are purged when user closes or refreshes tab
+  useEffect(() => {
+    const handleUnload = () => {
+      if (activeDocIdRef.current) {
+        purgeRemoteDocument(activeDocIdRef.current, true);
+      }
+    };
+    window.addEventListener('pagehide', handleUnload);
+    window.addEventListener('beforeunload', handleUnload);
+    return () => {
+      window.removeEventListener('pagehide', handleUnload);
+      window.removeEventListener('beforeunload', handleUnload);
+    };
+  }, []);
 
   // Fetch engine provider availability
   useEffect(() => {
@@ -365,42 +403,122 @@ export default function DocumentConverter() {
     }
 
     // ACCIDENT & INCIDENT REPORT AUTHENTIC MULTI-COLUMN FORM LAYOUT
+    const sortedByPos = (items) => [...items].sort((a, b) => {
+      const pDiff = (a.page || 1) - (b.page || 1);
+      if (pDiff !== 0) return pDiff;
+      const yDiff = (a.bounds?.y ?? 0.5) - (b.bounds?.y ?? 0.5);
+      if (Math.abs(yDiff) > 0.004) return yDiff;
+      return (a.bounds?.x ?? 0) - (b.bounds?.x ?? 0);
+    });
+    const nonBoolVal = (f) => {
+      if (!f || f.value === undefined || f.value === null) return '';
+      const v = String(f.value).trim();
+      return (!v || ['true', 'false'].includes(v.toLowerCase())) ? '' : v;
+    };
+    const isCbItem = (f) => f && (f.type === 'checkbox' || ['true', 'false', 'yes', 'no', '1', '0', '[x]', 'checked', 'x'].includes(String(f.value ?? '').toLowerCase().trim()));
     const findVal = (regex, defaultVal = '') => {
-      const f = fList.find(item => item && item.label && regex.test(item.label));
-      return (f && f.value !== undefined && f.value !== null && String(f.value).trim() !== '') ? String(f.value).trim() : defaultVal;
+      const hits = sortedByPos(fList.filter(item => item && item.label && regex.test(item.label)));
+      for (const f of hits) {
+        const v = nonBoolVal(f);
+        if (v) return v;
+      }
+      return defaultVal;
     };
-    const isChecked = (regex) => {
-      const f = fList.find(item => item && item.label && regex.test(item.label));
-      return f ? ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(f.value || '').toLowerCase()) : false;
+    const findByKey = (key) => {
+      const f = fList.find(item => item && item.fieldKey === key);
+      return nonBoolVal(f);
+    };
+    const isChecked = (regexOrKey) => {
+      if (typeof regexOrKey === 'string') {
+        const f = fList.find(item => item && item.fieldKey === regexOrKey && isCbItem(item));
+        if (f) return ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(f.value || '').toLowerCase().trim());
+      }
+      const rx = typeof regexOrKey === 'string' ? new RegExp(regexOrKey, 'i') : regexOrKey;
+      const f = fList.find(item => item && item.label && rx.test(item.label.trim()) && isCbItem(item));
+      return f ? ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(f.value || '').toLowerCase().trim()) : false;
     };
 
-    const refNo = findVal(/ref no/i, '');
-    const formDate = findVal(/form date/i, '');
-    const project = findVal(/project name/i, '');
-    const buildingAddress = findVal(/building address/i, '');
+    const completedByF = fList.find(f => f && f.label && /form\s*completed\s*by|^completed\s*by$/i.test(f.label.trim()));
+    const positionF = fList.find(f => f && f.label && /^position$/i.test(f.label.trim()));
+    const parentBannerF = fList.find(f => f && f.label && /parent\s*\/\s*guardian|parent.*guardian.*responsible\s*adult/i.test(f.label.trim()));
+    const commentsF = fList.find(f => f && f.label && /^comments?$/i.test(f.label.trim()));
+    const anchorYs = [completedByF?.bounds?.y, positionF?.bounds?.y, commentsF?.bounds?.y].filter(v => typeof v === 'number');
+    if (parentBannerF?.bounds?.y && parentBannerF.bounds.y > 0.65) anchorYs.push(parentBannerF.bounds.y - 0.04);
+    const signOffStartY = anchorYs.length > 0 ? Math.min(...anchorYs) - 0.02 : null;
 
-    const personName = findVal(/name of the person/i, '');
-    const dob = findVal(/d\.o\.b/i, '');
-    const age = findVal(/^age/i, '');
-    const regAddress = findVal(/registered address/i, '');
-    const postcode = findVal(/postcode/i, '');
-    const adult = findVal(/responsible adult/i, '');
-    const contact = findVal(/contact number/i, '');
-    const session = findVal(/session/i, '');
+    const genericDates = sortedByPos(
+      fList.filter(f => f && f.label && /^date$|date/i.test(f.label.trim()) && !/d\.o\.b|birth|signed|parent|incident|form\s*date/i.test(f.label) && nonBoolVal(f))
+    );
+    const upperDates = genericDates.filter(f => signOffStartY === null || (f.bounds?.y ?? 0) < signOffStartY);
+    const headerDateFb = nonBoolVal(upperDates.find(f => (f.bounds?.y ?? 0) < 0.36) || upperDates[0]);
+    const incDateFb = nonBoolVal(upperDates.find(f => (f.bounds?.y ?? 0) >= 0.36) || upperDates[1]);
+    let staffDateFb = '';
+    let parentDateFb = '';
+    if (signOffStartY !== null) {
+      const signDates = genericDates.filter(f => (f.bounds?.y ?? 0) >= signOffStartY);
+      if (typeof parentBannerF?.bounds?.y === 'number') {
+        staffDateFb = nonBoolVal(signDates.find(f => (f.bounds?.y ?? 0) < parentBannerF.bounds.y));
+        parentDateFb = nonBoolVal(signDates.find(f => (f.bounds?.y ?? 0) >= parentBannerF.bounds.y));
+      } else {
+        staffDateFb = nonBoolVal(signDates[0]);
+        parentDateFb = nonBoolVal(signDates[1]);
+      }
+    }
 
-    const incidentDate = findVal(/incident date/i, '');
-    const incidentTime = findVal(/incident time/i, '');
-    const location = findVal(/space|location/i, '');
+    const genericTimes = sortedByPos(fList.filter(f => f && f.label && /^time$/i.test(f.label.trim()) && nonBoolVal(f)));
+    const incTimeFb = nonBoolVal(genericTimes.find(f => signOffStartY !== null ? (f.bounds?.y ?? 0) < signOffStartY : (f.bounds?.y ?? 0) < 0.72));
+    const parentTimeFb = nonBoolVal(genericTimes.find(f => signOffStartY !== null ? (f.bounds?.y ?? 0) >= signOffStartY : (f.bounds?.y ?? 0) >= 0.72));
 
-    const narrative = findVal(/narrative/i, '');
-    const completedBy = findVal(/completed by/i, '');
-    const position = findVal(/position/i, '');
-    const signature = findVal(/signature/i, '');
-    const dateSigned = findVal(/date signed/i, '');
-    const parentSigned = findVal(/parent signed|parent.*guardian/i, '');
-    const parentDate = findVal(/parent.*date/i, '');
-    const parentTime = findVal(/parent.*time/i, '');
-    const comments = findVal(/comments/i, '');
+    const signedFields = sortedByPos(fList.filter(f => f && f.label && /^signed$/i.test(f.label.trim()) && nonBoolVal(f)));
+    let staffSignedFb = '';
+    let parentSignedFb = '';
+    if (typeof parentBannerF?.bounds?.y === 'number') {
+      staffSignedFb = nonBoolVal(signedFields.find(f => (f.bounds?.y ?? 0) < parentBannerF.bounds.y));
+      parentSignedFb = nonBoolVal(signedFields.find(f => (f.bounds?.y ?? 0) >= parentBannerF.bounds.y));
+    } else if (signedFields.length >= 2) {
+      staffSignedFb = nonBoolVal(signedFields[0]);
+      parentSignedFb = nonBoolVal(signedFields[1]);
+    } else if (signedFields.length === 1) {
+      if ((signedFields[0].bounds?.y ?? 0) >= 0.895) parentSignedFb = nonBoolVal(signedFields[0]);
+      else staffSignedFb = nonBoolVal(signedFields[0]);
+    }
+
+    let refNo = findByKey('refNo') || findVal(/ref\s*no|reference/i, '');
+    let formDate = findByKey('formDate') || findVal(/^form\s*date$/i, headerDateFb);
+    let project = findByKey('projectName') || findVal(/project\s*name/i, '');
+    let buildingAddress = findByKey('bldgAddress') || findVal(/building\s*address/i, '');
+
+    const dateProjectMatch = formDate.match(/^(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(.+)$/);
+    if (dateProjectMatch) {
+      formDate = dateProjectMatch[1].trim();
+      if (!project) {
+        project = dateProjectMatch[2].trim();
+      }
+    }
+
+    const personName = findByKey('personName') || findVal(/name of the person|^name$/i, '');
+    const dob = findByKey('dob') || findVal(/d\.o\.b|date of birth/i, '');
+    const age = findByKey('age') || findVal(/^age$/i, '');
+    const regAddress = findByKey('regAddress') || findVal(/registered\s*address/i, '');
+    const postcode = findByKey('postcode') || findVal(/^postcode$/i, '');
+    const adult = findByKey('responsibleAdult') || findVal(/^responsible\s*adult$/i, '');
+    const contact = findByKey('contactNumber') || findVal(/contact\s*number|phone|telephone/i, '');
+    const session = findByKey('session') || findVal(/session/i, '');
+
+    const incidentDate = findByKey('incidentDate') || findVal(/^incident\s*date$/i, incDateFb);
+    const incidentTime = findByKey('incidentTime') || findVal(/^incident\s*time$/i, incTimeFb);
+    const location = findByKey('location') || findVal(/space|location/i, '');
+
+    const narrative = findByKey('narrative') || findVal(/narrative/i, '');
+    const completedBy = findByKey('completedBy') || findVal(/completed\s*by/i, '');
+    const position = findByKey('position') || findVal(/^position$/i, '');
+    const signature = findByKey('signature') || findVal(/^staff\s*signature$|^signature$/i, staffSignedFb);
+    const dateSigned = findByKey('dateSigned') || findVal(/^date\s*signed$/i, staffDateFb);
+    const parentGuardianName = findByKey('parentGuardian') || nonBoolVal(parentBannerF);
+    const parentSigned = findByKey('parentSigned') || findVal(/^parent\s*signed$|^parent\s*signature$/i, parentSignedFb) || parentGuardianName;
+    const parentDate = findByKey('parentDate') || findVal(/^parent.*date$/i, parentDateFb);
+    const parentTime = findByKey('parentTime') || findVal(/^parent.*time$/i, parentTimeFb);
+    const comments = findByKey('comments') || findVal(/^comments?$/i, '');
 
     const tblBorder = '1px solid #1e3a5f';
     const cellPad = '6px 10px';
@@ -495,7 +613,7 @@ export default function DocumentConverter() {
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <tbody>
                     <tr>
-                      {renderCheckPill("EY Staff", isChecked(/staff:\s*ey staff/i))}
+                      {renderCheckPill("EY Staff", isChecked(/ey staff/i))}
                       {renderCheckPill("Non EY Staff", isChecked(/non ey staff/i))}
                       {renderCheckPill("Visitor", isChecked(/visitor/i))}
                       {renderCheckPill("Parent", isChecked(/parent/i))}
@@ -541,8 +659,8 @@ export default function DocumentConverter() {
             </tr>
             <tr>
               <td style={hdrStyle}>TYPE</td>
-              {renderCheckPill("ACCIDENT", isChecked(/incident type: accident|accident/i))}
-              {renderCheckPill("INCIDENT", isChecked(/incident type: incident/i))}
+              {renderCheckPill("ACCIDENT", isChecked(/accident/i))}
+              {renderCheckPill("INCIDENT", isChecked(/incident$/i))}
               <td colSpan={3} style={{ padding: 0 }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <tbody><tr>{renderCheckPill("NEAR MISS", isChecked(/near miss/i))}</tr></tbody>
@@ -562,33 +680,40 @@ export default function DocumentConverter() {
           </tbody>
         </table>
 
-        {/* 4. RIDDOR ? */}
-        <div style={bannerStyle}>RIDDOR ?</div>
-        <table style={{ width: '100%', borderCollapse: 'collapse', border: tblBorder, marginBottom: '14px' }}>
-          <tbody>
-            <tr>
-              {renderCheckPill("DANGEROUS OCCURRENCE", isChecked(/dangerous occurrence/i))}
-              {renderCheckPill("REPORTABLE DISEASE", isChecked(/reportable disease/i))}
-            </tr>
-            <tr>
-              {renderCheckPill("INJURY TO PUBLIC", isChecked(/injury to public/i))}
-              {renderCheckPill("INJURY 3 DAYS", isChecked(/injury 3 days/i))}
-            </tr>
-            <tr>
-              {renderCheckPill("MAJOR INJURY", isChecked(/major injury/i))}
-              {renderCheckPill("DEATH", isChecked(/death/i))}
-            </tr>
-          </tbody>
-        </table>
+        {/* 4. RIDDOR ? - only reportable if SEVERITY RIDDOR is selected */}
+        {(() => {
+          const isRiddorApplicable = isChecked(/severity:\s*riddor|^riddor$/i);
+          return (
+            <>
+              <div style={bannerStyle}>RIDDOR ?</div>
+              <table style={{ width: '100%', borderCollapse: 'collapse', border: tblBorder, marginBottom: '14px' }}>
+                <tbody>
+                  <tr>
+                    {renderCheckPill("DANGEROUS OCCURRENCE", isRiddorApplicable && isChecked(/dangerous occurrence/i))}
+                    {renderCheckPill("REPORTABLE DISEASE", isRiddorApplicable && isChecked(/reportable disease/i))}
+                  </tr>
+                  <tr>
+                    {renderCheckPill("INJURY TO PUBLIC", isRiddorApplicable && isChecked(/injury to public/i))}
+                    {renderCheckPill("INJURY 3 DAYS", isRiddorApplicable && isChecked(/injury 3 days/i))}
+                  </tr>
+                  <tr>
+                    {renderCheckPill("MAJOR INJURY", isRiddorApplicable && isChecked(/major injury/i))}
+                    {renderCheckPill("DEATH", isRiddorApplicable && isChecked(/death/i))}
+                  </tr>
+                </tbody>
+              </table>
+            </>
+          );
+        })()}
 
         {/* 5. CAUSE */}
         <div style={bannerStyle}>CAUSE</div>
         <table style={{ width: '100%', borderCollapse: 'collapse', border: tblBorder, marginBottom: '14px' }}>
           <tbody>
             <tr>
-              {renderCheckPill("CONTACT WITH PEER", isChecked(/contact with peer/i))}
-              {renderCheckPill("EQUIPMENT", isChecked(/cause: equipment/i))}
-              {renderCheckPill("UNKNOWN", isChecked(/cause: unknown/i))}
+              {renderCheckPill("CONTACT WITH PEER", isChecked(/contact\s*with(?:\s*peer)?/i))}
+              {renderCheckPill("EQUIPMENT", isChecked(/equipment/i))}
+              {renderCheckPill("UNKNOWN", isChecked(/unknown/i))}
             </tr>
             <tr>
               {renderCheckPill("SLIP / TRIP / FALL", isChecked(/slip/i))}
@@ -713,8 +838,13 @@ export default function DocumentConverter() {
               <td style={valStyle}>{dateSigned}</td>
             </tr>
             <tr>
-              <td colSpan={4} style={{ ...hdrStyle, background: '#f1f5f9', textAlign: 'center' }}>
-                PARENT / GUARDIAN / RESPONSIBLE ADULT
+              <td colSpan={4} style={{ ...hdrStyle, background: '#f1f5f9', textAlign: parentGuardianName ? 'left' : 'center' }}>
+                {parentGuardianName ? (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>PARENT / GUARDIAN / RESPONSIBLE ADULT</span>
+                    <span style={{ color: '#0f172a', fontWeight: 700 }}>{parentGuardianName}</span>
+                  </div>
+                ) : 'PARENT / GUARDIAN / RESPONSIBLE ADULT'}
               </td>
             </tr>
             <tr>
@@ -750,9 +880,13 @@ export default function DocumentConverter() {
   };
 
   // --------------------------------------------------------------------------
-  // Reset / Back to Upload Screen
+  // Reset / Back to Upload Screen (Immediately Purge Active Upload)
   // --------------------------------------------------------------------------
   const handleBackToUpload = () => {
+    if (activeDocIdRef.current) {
+      purgeRemoteDocument(activeDocIdRef.current);
+      activeDocIdRef.current = null;
+    }
     setDoc(null);
     setSelectedFieldId(null);
     setCurrentPage(1);
@@ -767,6 +901,11 @@ export default function DocumentConverter() {
   // --------------------------------------------------------------------------
   const handleFileUpload = async (file) => {
     if (!file) return;
+    const prevId = activeDocIdRef.current;
+    if (prevId) {
+      purgeRemoteDocument(prevId);
+      activeDocIdRef.current = null;
+    }
     setErrorMsg(null);
     setIsUploading(true);
     setUploadProgress('Preparing document...');
@@ -785,6 +924,7 @@ export default function DocumentConverter() {
 
       setUploadProgress('Uploading document...');
       const formData = new FormData();
+      if (prevId) formData.append('previousDocId', prevId);
       formData.append('document', fileToUpload);
 
       const res = await fetch(`${API_BASE}/upload`, {
@@ -845,6 +985,10 @@ export default function DocumentConverter() {
   // Load Sample Document
   // --------------------------------------------------------------------------
   const loadSample = async (sampleId) => {
+    if (activeDocIdRef.current) {
+      purgeRemoteDocument(activeDocIdRef.current);
+      activeDocIdRef.current = null;
+    }
     setErrorMsg(null);
     setIsUploading(true);
     setUploadProgress(`Loading sample: ${sampleId.replace('_', ' ')}...`);
@@ -872,6 +1016,15 @@ export default function DocumentConverter() {
   // --------------------------------------------------------------------------
   // Field Editing & Updates
   // --------------------------------------------------------------------------
+  const debouncedSyncFields = (fields, tables) => {
+    if (syncTimeoutRef.current) {
+      clearTimeout(syncTimeoutRef.current);
+    }
+    syncTimeoutRef.current = setTimeout(() => {
+      syncFieldsWithBackend(fields, tables);
+    }, 450);
+  };
+
   const updateField = (fieldId, updates) => {
     if (!doc) return;
     const updatedFields = doc.fields.map(f => {
@@ -882,8 +1035,7 @@ export default function DocumentConverter() {
     });
 
     setDoc(prev => ({ ...prev, fields: updatedFields }));
-    syncFieldsWithBackend(updatedFields, doc.tables);
-    setPreviewTimestamp(Date.now());
+    debouncedSyncFields(updatedFields, doc.tables);
   };
 
   const syncFieldsWithBackend = async (fields, tables) => {
@@ -1327,6 +1479,9 @@ export default function DocumentConverter() {
             >
               <option value="auto">Auto (Best Available)</option>
               <option value="builtin">Built-in Smart Local (Sharp + Tesseract)</option>
+              {systemStatus?.providers?.aws?.configured && (
+                <option value="aws">AWS Textract (Forms & Tables)</option>
+              )}
               {systemStatus?.providers?.azure?.configured && (
                 <option value="azure">Azure AI Document Intelligence</option>
               )}

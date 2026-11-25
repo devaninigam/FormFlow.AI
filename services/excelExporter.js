@@ -1,4 +1,5 @@
 const ExcelJS = require('exceljs');
+const { extractEarlyYearsFormModel } = require('./dynamicFormExtractor');
 
 /**
  * Excel (.xlsx) Document Generator
@@ -122,11 +123,14 @@ class ExcelExporter {
     };
 
     if (isAccidentReport) {
+      const eyModel = extractEarlyYearsFormModel(fields);
+      const eyChecked = eyModel.isChecked;
+
       // 1. ABOUT THIS FORM & IT'S COMPLETION
       addSectionBanner("ABOUT THIS FORM & IT'S COMPLETION");
-      setFieldPair('B', 'C', 'Ref No', findVal(/ref no|reference/i));
-      setFieldPair('D', 'E', 'DATE', findVal(/^form date$/i) || findVal(/form date/i));
-      setFieldPair('F', 'G', 'PROJECT NAME', findVal(/project name|project/i));
+      setFieldPair('B', 'C', 'Ref No', eyModel.refNo);
+      setFieldPair('D', 'E', 'DATE', eyModel.formDate);
+      setFieldPair('F', 'G', 'PROJECT NAME', eyModel.project);
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
@@ -139,7 +143,7 @@ class ExcelExporter {
 
       formSheet.mergeCells(`C${currentRow}:G${currentRow}`);
       const addrValCell = formSheet.getCell(`C${currentRow}`);
-      addrValCell.value = findVal(/building address|address/i);
+      addrValCell.value = eyModel.address;
       addrValCell.font = { name: 'Segoe UI', size: 9.5, bold: true, color: { argb: 'FF0F172A' } };
       addrValCell.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
       addrValCell.border = thinBorder;
@@ -148,35 +152,35 @@ class ExcelExporter {
 
       // 2. ABOUT THE PERSON
       addSectionBanner('ABOUT THE PERSON');
-      setFieldPair('B', 'C', 'Name of Person', findVal(/name of the person/i));
-      setFieldPair('D', 'E', 'D.O.B', findVal(/d\.o\.b|date of birth/i));
-      setFieldPair('F', 'G', 'Age', findVal(/^age$/i));
+      setFieldPair('B', 'C', 'Name of Person', eyModel.name);
+      setFieldPair('D', 'E', 'D.O.B', eyModel.dob);
+      setFieldPair('F', 'G', 'Age', eyModel.age);
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
-      setFieldPair('B', 'C', 'Registered Address', findVal(/registered address/i));
-      setFieldPair('D', 'E', 'Postcode', findVal(/postcode/i));
+      setFieldPair('B', 'C', 'Registered Address', eyModel.regAddress);
+      setFieldPair('D', 'E', 'Postcode', eyModel.postcode);
       setFieldPair('F', 'G', '', '');
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
       setFieldPair('B', 'C', '', '');
-      setFieldPair('D', 'E', 'Responsible Adult', findVal(/responsible adult/i));
+      setFieldPair('D', 'E', 'Responsible Adult', eyModel.adult);
       setFieldPair('F', 'G', '', '');
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
-      setFieldPair('B', 'C', 'Contact Number', findVal(/contact number/i));
+      setFieldPair('B', 'C', 'Contact Number', eyModel.contact);
       setFieldPair('D', 'E', '', '');
       setFieldPair('F', 'G', '', '');
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
       // Staff Row
-      const staffEy = isChecked(/staff:\s*ey staff/i);
-      const staffNonEy = isChecked(/staff:\s*non ey/i);
-      const staffVis = isChecked(/staff:\s*visitor/i);
-      const staffParent = isChecked(/staff:\s*parent/i);
+      const staffEy = eyChecked('staffEy');
+      const staffNonEy = eyChecked('staffNonEy');
+      const staffVis = eyChecked('staffVisitor');
+      const staffParent = eyChecked('staffParent');
 
       formSheet.getCell(`B${currentRow}`).value = 'STAFF';
       formSheet.getCell(`B${currentRow}`).font = { name: 'Segoe UI', size: 8.5, bold: true, color: { argb: 'FF475569' } };
@@ -196,9 +200,9 @@ class ExcelExporter {
       formSheet.getCell(`B${currentRow}`).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
       formSheet.getCell(`B${currentRow}`).border = thinBorder;
 
-      setCbCell('C', 'D', 'Daycare', isChecked(/child status:\s*daycare/i));
-      setCbCell('E', 'E', 'ToyBox', isChecked(/child status:\s*toybox/i));
-      setCbCell('F', 'G', 'SureStart', isChecked(/child status:\s*surestart/i));
+      setCbCell('C', 'D', 'Daycare', eyChecked('childDaycare'));
+      setCbCell('E', 'E', 'ToyBox', eyChecked('childToybox'));
+      setCbCell('F', 'G', 'SureStart', eyChecked('childSurestart'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
@@ -210,7 +214,7 @@ class ExcelExporter {
 
       formSheet.mergeCells(`C${currentRow}:G${currentRow}`);
       const sessVal = formSheet.getCell(`C${currentRow}`);
-      sessVal.value = findVal(/session activity|session/i);
+      sessVal.value = eyModel.session;
       sessVal.font = { name: 'Segoe UI', size: 9.5, bold: true, color: { argb: 'FF0F172A' } };
       sessVal.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
       sessVal.border = thinBorder;
@@ -219,9 +223,9 @@ class ExcelExporter {
 
       // 3. ABOUT THE INCIDENT
       addSectionBanner('ABOUT THE INCIDENT');
-      setFieldPair('B', 'C', 'DATE', findVal(/^incident date$/i) || findVal(/incident date/i));
-      setFieldPair('D', 'E', 'TIME', findVal(/incident time|time/i));
-      setFieldPair('F', 'G', 'SPACE', findVal(/space|location/i));
+      setFieldPair('B', 'C', 'DATE', eyModel.incDate);
+      setFieldPair('D', 'E', 'TIME', eyModel.incTime);
+      setFieldPair('F', 'G', 'SPACE', eyModel.location);
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
@@ -229,9 +233,9 @@ class ExcelExporter {
       formSheet.getCell(`B${currentRow}`).font = { name: 'Segoe UI', size: 8.5, bold: true, color: { argb: 'FF475569' } };
       formSheet.getCell(`B${currentRow}`).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
       formSheet.getCell(`B${currentRow}`).border = thinBorder;
-      setCbCell('C', 'D', 'ACCIDENT', isChecked(/incident type:\s*accident/i));
-      setCbCell('E', 'E', 'INCIDENT', isChecked(/incident type:\s*incident/i));
-      setCbCell('F', 'G', 'NEAR MISS', isChecked(/incident type:\s*near miss/i));
+      setCbCell('C', 'D', 'ACCIDENT', eyChecked('typeAccident'));
+      setCbCell('E', 'E', 'INCIDENT', eyChecked('typeIncident'));
+      setCbCell('F', 'G', 'NEAR MISS', eyChecked('typeNearMiss'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
@@ -239,86 +243,86 @@ class ExcelExporter {
       formSheet.getCell(`B${currentRow}`).font = { name: 'Segoe UI', size: 8.5, bold: true, color: { argb: 'FF475569' } };
       formSheet.getCell(`B${currentRow}`).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
       formSheet.getCell(`B${currentRow}`).border = thinBorder;
-      setCbCell('C', 'D', 'RIDDOR', isChecked(/severity:\s*riddor/i));
-      setCbCell('E', 'E', 'MODERATE', isChecked(/severity:\s*moderate/i));
-      setCbCell('F', 'G', 'MINOR', isChecked(/severity:\s*minor/i));
+      setCbCell('C', 'D', 'RIDDOR', eyChecked('severityRiddor'));
+      setCbCell('E', 'E', 'MODERATE', eyChecked('severityModerate'));
+      setCbCell('F', 'G', 'MINOR', eyChecked('severityMinor'));
       formSheet.getRow(currentRow).height = 22;
       currentRow += 2;
 
       // 4. RIDDOR ?
       addSectionBanner('RIDDOR ?');
-      setCbCell('B', 'D', 'DANGEROUS OCCURRENCE', isChecked(/riddor:\s*dangerous/i));
-      setCbCell('E', 'G', 'REPORTABLE DISEASE', isChecked(/riddor:\s*reportable/i));
+      setCbCell('B', 'D', 'DANGEROUS OCCURRENCE', eyChecked('riddorDangerous'));
+      setCbCell('E', 'G', 'REPORTABLE DISEASE', eyChecked('riddorDisease'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'INJURY TO PUBLIC', isChecked(/riddor:\s*injury to public/i));
-      setCbCell('E', 'G', 'INJURY 3 DAYS', isChecked(/riddor:\s*injury 3 days/i));
+      setCbCell('B', 'D', 'INJURY TO PUBLIC', eyChecked('riddorPublic'));
+      setCbCell('E', 'G', 'INJURY 3 DAYS', eyChecked('riddor3Days'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'MAJOR INJURY', isChecked(/riddor:\s*major/i));
-      setCbCell('E', 'G', 'DEATH', isChecked(/riddor:\s*death/i));
+      setCbCell('B', 'D', 'MAJOR INJURY', eyChecked('riddorMajor'));
+      setCbCell('E', 'G', 'DEATH', eyChecked('riddorDeath'));
       formSheet.getRow(currentRow).height = 22;
       currentRow += 2;
 
       // 5. CAUSE
       addSectionBanner('CAUSE');
-      setCbCell('B', 'C', 'CONTACT WITH PEER', isChecked(/cause:\s*contact/i));
-      setCbCell('D', 'E', 'EQUIPMENT', isChecked(/cause:\s*equipment/i));
-      setCbCell('F', 'G', 'UNKNOWN', isChecked(/cause:\s*unknown/i));
+      setCbCell('B', 'C', 'CONTACT WITH PEER', eyChecked('causePeer'));
+      setCbCell('D', 'E', 'EQUIPMENT', eyChecked('causeEquip'));
+      setCbCell('F', 'G', 'UNKNOWN', eyChecked('causeUnknown'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'C', 'SLIP/TRIP/FALL', isChecked(/cause:\s*slip/i));
-      setCbCell('D', 'E', 'COSHH', isChecked(/cause:\s*coshh/i));
-      setCbCell('F', 'G', 'TRAFFIC', isChecked(/cause:\s*traffic/i));
+      setCbCell('B', 'C', 'SLIP/TRIP/FALL', eyChecked('causeSlip'));
+      setCbCell('D', 'E', 'COSHH', eyChecked('causeCoshh'));
+      setCbCell('F', 'G', 'TRAFFIC', eyChecked('causeTraffic'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'C', 'MANUAL HANDLING', isChecked(/cause:\s*manual/i));
-      setCbCell('D', 'E', 'CHOKING', isChecked(/cause:\s*choking/i));
-      setCbCell('F', 'G', 'VENUE', isChecked(/cause:\s*venue/i));
+      setCbCell('B', 'C', 'MANUAL HANDLING', eyChecked('causeManual'));
+      setCbCell('D', 'E', 'CHOKING', eyChecked('causeChoking'));
+      setCbCell('F', 'G', 'VENUE', eyChecked('causeVenue'));
       formSheet.getRow(currentRow).height = 22;
       currentRow += 2;
 
       // 6. TYPE OF INJURY
       addSectionBanner('TYPE OF INJURY');
-      setCbCell('B', 'D', 'ABRASION / SMALL CUT / LIGHT BLEED', isChecked(/injury:\s*abrasion/i));
-      setCbCell('E', 'G', 'BRUISE / SWELLING / REDNESS', isChecked(/injury:\s*bruise/i));
+      setCbCell('B', 'D', 'ABRASION / SMALL CUT / LIGHT BLEED', eyChecked('injuryCut'));
+      setCbCell('E', 'G', 'BRUISE / SWELLING / REDNESS', eyChecked('injuryBruise'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'STRAIN / DISLOCATION', isChecked(/injury:\s*strain/i));
-      setCbCell('E', 'G', 'FRACTURE / BROKEN BONE', isChecked(/injury:\s*fracture/i));
+      setCbCell('B', 'D', 'STRAIN / DISLOCATION', eyChecked('injuryStrain'));
+      setCbCell('E', 'G', 'FRACTURE / BROKEN BONE', eyChecked('injuryFracture'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'INJURY TO HEAD / FACE', isChecked(/injury:\s*injury to head/i));
-      setCbCell('E', 'G', 'SENSORY LOSS', isChecked(/injury:\s*sensory/i));
+      setCbCell('B', 'D', 'INJURY TO HEAD / FACE', eyChecked('injuryHead'));
+      setCbCell('E', 'G', 'SENSORY LOSS', eyChecked('injurySensory'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'LOSS OF CONSCIOUSNESS', isChecked(/injury:\s*loss of/i));
-      setCbCell('E', 'G', 'ORGAN INJURY / OPEN WOUND', isChecked(/injury:\s*organ/i));
+      setCbCell('B', 'D', 'LOSS OF CONSCIOUSNESS', eyChecked('injuryConscious'));
+      setCbCell('E', 'G', 'ORGAN INJURY / OPEN WOUND', eyChecked('injuryOrgan'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'PROPERTY DAMAGE (INC VEHICLE)', isChecked(/injury:\s*property/i));
-      setCbCell('E', 'G', 'EMOTIONAL DISTRESS', isChecked(/injury:\s*emotional/i));
+      setCbCell('B', 'D', 'PROPERTY DAMAGE (INC VEHICLE)', eyChecked('injuryProperty'));
+      setCbCell('E', 'G', 'EMOTIONAL DISTRESS', eyChecked('injuryDistress'));
       formSheet.getRow(currentRow).height = 22;
       currentRow += 2;
 
       // 7. OUTCOME OF INCIDENT
       addSectionBanner('OUTCOME OF INCIDENT');
-      setCbCell('B', 'D', 'RETURN TO ACTIVITIES', isChecked(/outcome:\s*return/i));
-      setCbCell('E', 'G', 'FIRST AID APPLIED', isChecked(/outcome:\s*first aid/i));
+      setCbCell('B', 'D', 'RETURN TO ACTIVITIES', eyChecked('outcomeReturn'));
+      setCbCell('E', 'G', 'FIRST AID APPLIED', eyChecked('outcomeFirstAid'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'TO RESPONSIBLE ADULT CARE', isChecked(/outcome:\s*to responsible/i));
-      setCbCell('E', 'G', 'NIAS CALLED', isChecked(/outcome:\s*nias/i));
+      setCbCell('B', 'D', 'TO RESPONSIBLE ADULT CARE', eyChecked('outcomeAdultCare'));
+      setCbCell('E', 'G', 'NIAS CALLED', eyChecked('outcomeNias'));
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
-      setCbCell('B', 'D', 'HOSPITAL ADMITTANCE', isChecked(/outcome:\s*hospital/i));
-      setCbCell('E', 'G', 'EMOTIONAL SUPPORT', isChecked(/outcome:\s*emotional/i));
+      setCbCell('B', 'D', 'HOSPITAL ADMITTANCE', eyChecked('outcomeHospital'));
+      setCbCell('E', 'G', 'EMOTIONAL SUPPORT', eyChecked('outcomeSupport'));
       formSheet.getRow(currentRow).height = 22;
       currentRow += 2;
 
       // 8. NARRATIVE
       addSectionBanner('NARRATIVE');
-      const narrativeVal = findVal(/narrative|description/i);
+      const narrativeVal = eyModel.narrative;
       const narrativeLines = narrativeVal.split('\n').filter(Boolean);
       for (const line of (narrativeLines.length > 0 ? narrativeLines : ['(No narrative entered)'])) {
         formSheet.mergeCells(`B${currentRow}:G${currentRow}`);
@@ -334,35 +338,37 @@ class ExcelExporter {
 
       // 9. SIGN-OFF & AUTHORIZATION
       addSectionBanner('SIGN-OFF & AUTHORIZATION');
-      setFieldPair('B', 'C', 'FORM COMPLETED BY', findVal(/completed by/i));
-      setFieldPair('D', 'G', 'POSITION', findVal(/position/i));
+      setFieldPair('B', 'C', 'FORM COMPLETED BY', eyModel.completedBy);
+      setFieldPair('D', 'G', 'POSITION', eyModel.position);
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
-      setFieldPair('B', 'C', 'SIGNED', findVal(/signature/i));
-      setFieldPair('D', 'G', 'DATE', findVal(/date signed/i));
+      setFieldPair('B', 'C', 'SIGNED', eyModel.signature);
+      setFieldPair('D', 'G', 'DATE', eyModel.dateSigned);
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
       formSheet.mergeCells(`B${currentRow}:G${currentRow}`);
       const parCell = formSheet.getCell(`B${currentRow}`);
-      parCell.value = 'PARENT / GUARDIAN / RESPONSIBLE ADULT';
+      parCell.value = eyModel.parentGuardianName
+        ? `PARENT / GUARDIAN / RESPONSIBLE ADULT: ${eyModel.parentGuardianName}`
+        : 'PARENT / GUARDIAN / RESPONSIBLE ADULT';
       parCell.font = { name: 'Segoe UI', size: 8.5, bold: true, color: { argb: 'FF475569' } };
       parCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
       parCell.border = thinBorder;
       formSheet.getRow(currentRow).height = 20;
       currentRow++;
 
-      setFieldPair('B', 'C', 'SIGNED', '_______________________');
-      setFieldPair('D', 'E', 'DATE', '____________');
-      setFieldPair('F', 'G', 'TIME', '_________');
+      setFieldPair('B', 'C', 'SIGNED', eyModel.parentSigned || '_______________________');
+      setFieldPair('D', 'E', 'DATE', eyModel.parentDate || '____________');
+      setFieldPair('F', 'G', 'TIME', eyModel.parentTime || '_________');
       formSheet.getRow(currentRow).height = 22;
       currentRow++;
 
       formSheet.mergeCells(`B${currentRow}:G${currentRow}`);
       const commCell = formSheet.getCell(`B${currentRow}`);
-      commCell.value = 'COMMENTS: ____________________________________________________________________';
-      commCell.font = { name: 'Segoe UI', size: 8.5, color: { argb: 'FF64748B' } };
+      commCell.value = `COMMENTS: ${eyModel.comments || '____________________________________________________________________'}`;
+      commCell.font = { name: 'Segoe UI', size: 8.5, bold: !!eyModel.comments, color: { argb: eyModel.comments ? 'FF0F172A' : 'FF64748B' } };
       commCell.border = thinBorder;
       formSheet.getRow(currentRow).height = 24;
       currentRow++;

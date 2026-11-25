@@ -11,6 +11,7 @@ const {
   HeadingLevel,
   AlignmentType
 } = require('docx');
+const { extractEarlyYearsFormModel } = require('./dynamicFormExtractor');
 
 /**
  * Word (.docx) Document Generator
@@ -184,33 +185,34 @@ class WordExporter {
       // -------------------------------------------------------------
       // Authentic Accident & Incident Report Form Document (Matches Image 2)
       // -------------------------------------------------------------
-      const refNo = findVal(/ref\s*no|reference/i, '');
-      const formDate = findVal(/^form date/i, '');
-      const project = findVal(/project name|project/i, '');
-      const address = findVal(/building address|address/i, '');
-
-      const name = findVal(/name of the person/i, '');
-      const dob = findVal(/d\.o\.b|date of birth/i, '');
-      const age = findVal(/^age/i, '');
-      const regAddress = findVal(/registered address/i, '');
-      const postcode = findVal(/postcode/i, '');
-      const contact = findVal(/contact number/i, '');
-      const adult = findVal(/responsible adult/i, '');
-      const session = findVal(/session/i, '');
-
-      const incDate = findVal(/^incident date/i, '');
-      const incTime = findVal(/incident time|^time/i, '');
-      const location = findVal(/space|location|room/i, '');
-
-      const narrative = findVal(/narrative/i, '');
-      const completedBy = findVal(/completed by/i, '');
-      const position = findVal(/position/i, '');
-      const signature = findVal(/signature/i, '');
-      const dateSigned = findVal(/date signed/i, '');
-      const parentSigned = findVal(/parent signed|parent.*guardian/i, '');
-      const parentDate = findVal(/parent.*date/i, '');
-      const parentTime = findVal(/parent.*time/i, '');
-      const comments = findVal(/comments/i, '');
+      const eyModel = extractEarlyYearsFormModel(fields);
+      const {
+        refNo,
+        formDate,
+        project,
+        address,
+        name,
+        dob,
+        regAddress,
+        postcode,
+        contact,
+        adult,
+        session,
+        incDate,
+        incTime,
+        location,
+        narrative,
+        completedBy,
+        position,
+        signature,
+        dateSigned,
+        parentGuardianName,
+        parentSigned,
+        parentDate,
+        parentTime,
+        comments,
+        isChecked: eyChecked
+      } = eyModel;
 
       // Title & Subtitle
       children.push(
@@ -312,13 +314,13 @@ class WordExporter {
       );
 
       // Section 2: ABOUT THE PERSON
-      const staffEy = isChecked(/staff:\s*ey staff/i);
-      const staffNonEy = isChecked(/staff:\s*non ey/i);
-      const staffVis = isChecked(/staff:\s*visitor/i);
-      const staffParent = isChecked(/staff:\s*parent/i);
-      const childDaycare = isChecked(/child status:\s*daycare|daycare/i);
-      const childToybox = isChecked(/child status:\s*toybox|toybox/i);
-      const childSurestart = isChecked(/child status:\s*surestart|surestart/i);
+      const staffEy = eyChecked('staffEy');
+      const staffNonEy = eyChecked('staffNonEy');
+      const staffVis = eyChecked('staffVisitor');
+      const staffParent = eyChecked('staffParent');
+      const childDaycare = eyChecked('childDaycare');
+      const childToybox = eyChecked('childToybox');
+      const childSurestart = eyChecked('childSurestart');
 
       // Discrete session characters
       const sessionRuns = [];
@@ -408,9 +410,9 @@ class WordExporter {
       );
 
       // Section 3: ABOUT THE INCIDENT
-      const typeAccident = isChecked(/incident type:\s*accident|accident/i);
-      const typeIncident = isChecked(/incident type:\s*incident/i);
-      const typeNearMiss = isChecked(/near miss/i);
+      const typeAccident = eyChecked('typeAccident');
+      const typeIncident = eyChecked('typeIncident');
+      const typeNearMiss = eyChecked('typeNearMiss');
 
       children.push(
         new Table({
@@ -438,9 +440,9 @@ class WordExporter {
             new TableRow({
               children: [
                 makeHdrCell('SEVERITY', 16),
-                makeCheckPillCell('RIDDOR', isChecked(/severity:\s*riddor/i), 28),
-                makeCheckPillCell('MODERATE', isChecked(/severity:\s*moderate/i), 28),
-                makeCheckPillCell('MINOR', isChecked(/severity:\s*minor/i), 28, 3)
+                makeCheckPillCell('RIDDOR', eyChecked('severityRiddor'), 28),
+                makeCheckPillCell('MODERATE', eyChecked('severityModerate'), 28),
+                makeCheckPillCell('MINOR', eyChecked('severityMinor'), 28, 3)
               ]
             })
           ]
@@ -456,20 +458,20 @@ class WordExporter {
             makeBannerRow('RIDDOR ?', 2),
             new TableRow({
               children: [
-                makeCheckPillCell('DANGEROUS OCCURRENCE', isChecked(/dangerous/i), 50),
-                makeCheckPillCell('REPORTABLE DISEASE', isChecked(/reportable/i), 50)
+                makeCheckPillCell('DANGEROUS OCCURRENCE', eyChecked('riddorDangerous'), 50),
+                makeCheckPillCell('REPORTABLE DISEASE', eyChecked('riddorDisease'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('INJURY TO PUBLIC', isChecked(/injury to public/i), 50),
-                makeCheckPillCell('INJURY 3 DAYS', isChecked(/injury 3 days/i), 50)
+                makeCheckPillCell('INJURY TO PUBLIC', eyChecked('riddorPublic'), 50),
+                makeCheckPillCell('INJURY 3 DAYS', eyChecked('riddor3Days'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('MAJOR INJURY', isChecked(/major/i), 50),
-                makeCheckPillCell('DEATH', isChecked(/death/i), 50)
+                makeCheckPillCell('MAJOR INJURY', eyChecked('riddorMajor'), 50),
+                makeCheckPillCell('DEATH', eyChecked('riddorDeath'), 50)
               ]
             })
           ]
@@ -485,23 +487,23 @@ class WordExporter {
             makeBannerRow('CAUSE', 3),
             new TableRow({
               children: [
-                makeCheckPillCell('CONTACT WITH PEER', isChecked(/contact/i), 34),
-                makeCheckPillCell('EQUIPMENT', isChecked(/equipment/i), 33),
-                makeCheckPillCell('UNKNOWN', isChecked(/unknown/i), 33)
+                makeCheckPillCell('CONTACT WITH PEER', eyChecked('causePeer'), 34),
+                makeCheckPillCell('EQUIPMENT', eyChecked('causeEquip'), 33),
+                makeCheckPillCell('UNKNOWN', eyChecked('causeUnknown'), 33)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('SLIP / TRIP / FALL', isChecked(/slip/i), 34),
-                makeCheckPillCell('COSHH', isChecked(/coshh/i), 33),
-                makeCheckPillCell('TRAFFIC', isChecked(/traffic/i), 33)
+                makeCheckPillCell('SLIP / TRIP / FALL', eyChecked('causeSlip'), 34),
+                makeCheckPillCell('COSHH', eyChecked('causeCoshh'), 33),
+                makeCheckPillCell('TRAFFIC', eyChecked('causeTraffic'), 33)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('MANUAL HANDLING', isChecked(/manual/i), 34),
-                makeCheckPillCell('CHOKING', isChecked(/choking/i), 33),
-                makeCheckPillCell('VENUE', isChecked(/venue/i), 33)
+                makeCheckPillCell('MANUAL HANDLING', eyChecked('causeManual'), 34),
+                makeCheckPillCell('CHOKING', eyChecked('causeChoking'), 33),
+                makeCheckPillCell('VENUE', eyChecked('causeVenue'), 33)
               ]
             })
           ]
@@ -517,32 +519,32 @@ class WordExporter {
             makeBannerRow('TYPE OF INJURY', 2),
             new TableRow({
               children: [
-                makeCheckPillCell('ABRASION / SMALL CUT / LIGHT BLEED', isChecked(/abrasion|cut/i), 50),
-                makeCheckPillCell('BRUISE / SWELLING / REDNESS', isChecked(/bruise/i), 50)
+                makeCheckPillCell('ABRASION / SMALL CUT / LIGHT BLEED', eyChecked('injuryCut'), 50),
+                makeCheckPillCell('BRUISE / SWELLING / REDNESS', eyChecked('injuryBruise'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('STRAIN / DISLOCATION', isChecked(/strain/i), 50),
-                makeCheckPillCell('FRACTURE / BROKEN BONE', isChecked(/fracture/i), 50)
+                makeCheckPillCell('STRAIN / DISLOCATION', eyChecked('injuryStrain'), 50),
+                makeCheckPillCell('FRACTURE / BROKEN BONE', eyChecked('injuryFracture'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('INJURY TO HEAD / FACE', isChecked(/injury to head/i), 50),
-                makeCheckPillCell('SENSORY LOSS', isChecked(/sensory/i), 50)
+                makeCheckPillCell('INJURY TO HEAD / FACE', eyChecked('injuryHead'), 50),
+                makeCheckPillCell('SENSORY LOSS', eyChecked('injurySensory'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('LOSS OF CONSCIOUSNESS', isChecked(/consciousness/i), 50),
-                makeCheckPillCell('ORGAN INJURY / OPEN WOUND', isChecked(/organ/i), 50)
+                makeCheckPillCell('LOSS OF CONSCIOUSNESS', eyChecked('injuryConscious'), 50),
+                makeCheckPillCell('ORGAN INJURY / OPEN WOUND', eyChecked('injuryOrgan'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('PROPERTY DAMAGE (INC VEHICLE)', isChecked(/property/i), 50),
-                makeCheckPillCell('EMOTIONAL DISTRESS', isChecked(/emotional/i), 50)
+                makeCheckPillCell('PROPERTY DAMAGE (INC VEHICLE)', eyChecked('injuryProperty'), 50),
+                makeCheckPillCell('EMOTIONAL DISTRESS', eyChecked('injuryDistress'), 50)
               ]
             })
           ]
@@ -558,20 +560,20 @@ class WordExporter {
             makeBannerRow('OUTCOME OF INCIDENT', 2),
             new TableRow({
               children: [
-                makeCheckPillCell('RETURN TO ACTIVITIES', isChecked(/return to activities/i), 50),
-                makeCheckPillCell('FIRST AID APPLIED', isChecked(/first aid/i), 50)
+                makeCheckPillCell('RETURN TO ACTIVITIES', eyChecked('outcomeReturn'), 50),
+                makeCheckPillCell('FIRST AID APPLIED', eyChecked('outcomeFirstAid'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('TO RESPONSIBLE ADULT CARE', isChecked(/to responsible/i), 50),
-                makeCheckPillCell('NIAS CALLED', isChecked(/nias/i), 50)
+                makeCheckPillCell('TO RESPONSIBLE ADULT CARE', eyChecked('outcomeAdultCare'), 50),
+                makeCheckPillCell('NIAS CALLED', eyChecked('outcomeNias'), 50)
               ]
             }),
             new TableRow({
               children: [
-                makeCheckPillCell('HOSPITAL ADMITTANCE', isChecked(/hospital/i), 50),
-                makeCheckPillCell('EMOTIONAL SUPPORT', isChecked(/emotional/i), 50)
+                makeCheckPillCell('HOSPITAL ADMITTANCE', eyChecked('outcomeHospital'), 50),
+                makeCheckPillCell('EMOTIONAL SUPPORT', eyChecked('outcomeSupport'), 50)
               ]
             })
           ]
@@ -648,9 +650,14 @@ class WordExporter {
               ]
             }),
             new TableRow({
-              children: [
-                makeHdrCell('PARENT / GUARDIAN / RESPONSIBLE ADULT', 100, 6, { bg: 'F1F5F9', color: '1E3A5F', align: AlignmentType.CENTER })
-              ]
+              children: parentGuardianName
+                ? [
+                    makeHdrCell('PARENT / GUARDIAN / RESPONSIBLE ADULT', 44, 2, { bg: 'F1F5F9', color: '1E3A5F' }),
+                    makeValCell(parentGuardianName, 56, 4)
+                  ]
+                : [
+                    makeHdrCell('PARENT / GUARDIAN / RESPONSIBLE ADULT', 100, 6, { bg: 'F1F5F9', color: '1E3A5F', align: AlignmentType.CENTER })
+                  ]
             }),
             new TableRow({
               children: [

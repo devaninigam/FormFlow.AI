@@ -10,26 +10,31 @@ const { createCanvas } = require('@napi-rs/canvas');
  */
 class ImagePreprocessor {
   /**
-   * Convert uploaded file (PDF or Image) into high-resolution page buffers and metadata.
-   * @param {string} filePath - Absolute path to uploaded document
+   * Convert uploaded file buffer (or disk path for samples/tests) into high-resolution page buffers and metadata.
+   * Accepts Buffer directly so user uploads never need to touch disk.
+   * @param {Buffer|string} input - Document Buffer in memory or file path
    * @param {string} mimeType - File MIME type
    * @returns {Promise<Array<{ pageNumber: number, width: number, height: number, buffer: Buffer, originalType: string }>>}
    */
-  static async extractPages(filePath, mimeType) {
-    const isPdf = mimeType === 'application/pdf' || filePath.toLowerCase().endsWith('.pdf');
+  static async extractPages(input, mimeType) {
+    const isPdf =
+      mimeType === 'application/pdf' ||
+      (typeof input === 'string' && input.toLowerCase().endsWith('.pdf'));
 
     if (isPdf) {
-      return await this.extractPdfPages(filePath);
+      return await this.extractPdfPages(input);
     } else {
-      return await this.extractImagePages(filePath);
+      return await this.extractImagePages(input);
     }
   }
 
   /**
    * Rasterize PDF pages using pdfjs-dist and @napi-rs/canvas
    */
-  static async extractPdfPages(filePath) {
-    const data = new Uint8Array(fs.readFileSync(filePath));
+  static async extractPdfPages(input) {
+    const data = Buffer.isBuffer(input)
+      ? new Uint8Array(input)
+      : new Uint8Array(fs.readFileSync(input));
     const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
     const wasmUrl = path.resolve(__dirname, '../node_modules/pdfjs-dist/wasm') + '/';
@@ -48,72 +53,79 @@ class ImagePreprocessor {
 
     const pdfDoc = await loadingTask.promise;
     const numPages = pdfDoc.numPages;
+    // Process all pages safely (up to 50 pages per document to prevent memory issues)
+    const maxPagesToProcess = Math.min(numPages, 50);
     const pages = [];
+    // Scale 2.5 (~180 DPI) for sharp OCR rendering; scale 2.0 for large multi-page docs
+    const renderScale = maxPagesToProcess > 10 ? 2.0 : 2.5;
 
-    for (let i = 1; i <= numPages; i++) {
-      const page = await pdfDoc.getPage(i);
-      // Render at 2.0 scale (approx 144-150 DPI) for crisp OCR and preview
-      const viewport = page.getViewport({ scale: 2.0 });
-      const canvas = createCanvas(viewport.width, viewport.height);
-      const ctx = canvas.getContext('2d');
+    try {
+      for (let i = 1; i <= maxPagesToProcess; i++) {
+        const page = await pdfDoc.getPage(i);
+        const viewport = page.getViewport({ scale: renderScale });
+        const canvas = createCanvas(viewport.width, viewport.height);
+        const ctx = canvas.getContext('2d');
 
-      // Fill white background before rendering PDF
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, viewport.width, viewport.height);
+        // Fill white background before rendering PDF
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, viewport.width, viewport.height);
 
-      await page.render({
-        canvasContext: ctx,
-        viewport
-      }).promise;
+        await page.render({
+          canvasContext: ctx,
+          viewport
+        }).promise;
 
-      // Extract native digital text items and exact coordinates if present
-      let textItems = [];
-      try {
-        const textContent = await page.getTextContent();
-        textItems = (textContent.items || []).map(it => {
-          const [vx, vy] = viewport.convertToViewportPoint(it.transform[4], it.transform[5]);
-          const w = (it.width || 0) * 2.0;
-          const h = (it.height || 0) * 2.0;
-          return {
-            str: it.str || '',
-            vx: Math.round(vx),
-            vy: Math.round(vy),
-            w: Math.round(w),
-            h: Math.round(h),
-            normX: Number((vx / viewport.width).toFixed(4)),
-            normY: Number(((vy - h) / viewport.height).toFixed(4)),
-            normW: Number((w / viewport.width).toFixed(4)),
-            normH: Number((h / viewport.height).toFixed(4))
-          };
-        }).filter(it => it.str && it.str.trim().length > 0);
-      } catch (err) {
-        console.warn('PDF text extraction error on page', i, err.message);
+        // Extract native digital text items and exact coordinates if present
+        let textItems = [];
+        try {
+          const textContent = await page.getTextContent();
+          textItems = (textContent.items || []).map(it => {
+            const [vx, vy] = viewport.convertToViewportPoint(it.transform[4], it.transform[5]);
+            const w = (it.width || 0) * renderScale;
+            const h = (it.height || 0) * renderScale;
+            return {
+              str: it.str || '',
+              vx: Math.round(vx),
+              vy: Math.round(vy),
+              w: Math.round(w),
+              h: Math.round(h),
+              normX: Number((vx / viewport.width).toFixed(4)),
+              normY: Number(((vy - h) / viewport.height).toFixed(4)),
+              normW: Number((w / viewport.width).toFixed(4)),
+              normH: Number((h / viewport.height).toFixed(4))
+            };
+          }).filter(it => it.str && it.str.trim().length > 0);
+        } catch (err) {
+          console.warn('PDF text extraction error on page', i, err.message);
+        }
+
+        const pngBuffer = canvas.toBuffer('image/png');
+        pages.push({
+          pageNumber: i,
+          width: Math.round(viewport.width),
+          height: Math.round(viewport.height),
+          pdfPointsWidth: Math.round(viewport.width / renderScale),
+          pdfPointsHeight: Math.round(viewport.height / renderScale),
+          buffer: pngBuffer,
+          originalType: 'pdf',
+          textItems,
+          fullText: textItems.map(it => it.str).join(' ')
+        });
       }
-
-      const pngBuffer = canvas.toBuffer('image/png');
-      pages.push({
-        pageNumber: i,
-        width: Math.round(viewport.width),
-        height: Math.round(viewport.height),
-        pdfPointsWidth: Math.round(viewport.width / 2.0),
-        pdfPointsHeight: Math.round(viewport.height / 2.0),
-        buffer: pngBuffer,
-        originalType: 'pdf',
-        textItems,
-        fullText: textItems.map(it => it.str).join(' ')
-      });
+    } finally {
+      try { await pdfDoc.destroy?.(); } catch (_) { /* ignore */ }
     }
 
     return pages;
   }
 
   /**
-   * Process standard image file (JPEG, PNG, TIFF, WEBP, BMP, etc.)
+   * Process standard image buffer/file (JPEG, PNG, TIFF, WEBP, BMP, etc.)
    * Auto-orients EXIF, normalizes high-resolution camera photos (e.g. 12MP-48MP)
    * to safe dimensions to prevent OOM and timeouts, and sharpens low-resolution scans.
    */
-  static async extractImagePages(filePath) {
-    let image = sharp(filePath, { failOnError: false }).rotate(); // auto-orient based on EXIF
+  static async extractImagePages(input) {
+    let image = sharp(input, { failOnError: false }).rotate(); // auto-orient based on EXIF
     const metadata = await image.metadata();
 
     let currentW = metadata.width || 1600;
@@ -123,15 +135,15 @@ class ImagePreprocessor {
       [currentW, currentH] = [currentH, currentW];
     }
 
-    const maxDim = 2200;
+    const maxDim = 3200;
     const minDim = 1200;
     let finalW = currentW;
     let finalH = currentH;
     let processedImage = image;
 
     if (Math.max(currentW, currentH) > maxDim) {
-      // Scale down excessively large images (e.g. 3024x4032 camera photos)
-      // to optimal OCR resolution (~1650x2200) to keep memory footprint light
+      // Scale down excessively large images (e.g. 48MP camera photos)
+      // to optimal OCR resolution (~2400x3200) to keep memory footprint light and sharp
       const scale = maxDim / Math.max(currentW, currentH);
       finalW = Math.round(currentW * scale);
       finalH = Math.round(currentH * scale);
@@ -191,6 +203,10 @@ class ImagePreprocessor {
       }
 
       const b = field.bounds;
+      // Skip fields with unlocalized/default fallback bounds (e.g. { x: 0.1, y: 0.1 }) to avoid wiping headers
+      if ((b.x === 0.1 && b.y === 0.1) || (b.x === 0.1 && b.y === 0.3) || b.width > 0.65) {
+        continue;
+      }
 
       // Convert normalized bounds (0..1) to actual pixel coordinates
       const pxX = Math.max(0, Math.floor(b.x * pageWidth));
@@ -212,7 +228,7 @@ class ImagePreprocessor {
           const brightness = (r + g + bVal) / 3;
 
           // Sample brighter pixels as paper background (ignore ink)
-          if (brightness >= 235) {
+          if (brightness >= 220) {
             bgR += r;
             bgG += g;
             bgB += bVal;
@@ -227,7 +243,7 @@ class ImagePreprocessor {
           for (let x = pxX; x < pxX + pxW; x++) {
             const idx = (y * pageWidth + x) * 4;
             const brightness = (fullPixels[idx] + fullPixels[idx + 1] + fullPixels[idx + 2]) / 3;
-            if (brightness >= 190) {
+            if (brightness >= 180) {
               bgR += fullPixels[idx];
               bgG += fullPixels[idx + 1];
               bgB += fullPixels[idx + 2];
@@ -241,15 +257,12 @@ class ImagePreprocessor {
         r: Math.round(bgR / bgCount),
         g: Math.round(bgG / bgCount),
         b: Math.round(bgB / bgCount)
-      } : { r: 254, g: 254, b: 254 };
+      } : { r: 250, g: 250, b: 250 };
 
       const paperBrightness = (paperColor.r + paperColor.g + paperColor.b) / 3;
-      if (paperBrightness >= 240) {
-        paperColor.r = 254;
-        paperColor.g = 254;
-        paperColor.b = 254;
-      }
-      const inkThreshold = paperBrightness >= 238 ? 253 : Math.min(252, Math.max(225, Math.round(paperBrightness - 1)));
+      // Only target actual dark handwriting ink (significantly darker than paper background).
+      // Never set threshold near paper brightness, which causes opaque white-out blocks!
+      const inkThreshold = Math.min(175, Math.max(90, Math.round(paperBrightness - 45)));
 
       // 2. Line detection map to preserve underlines and vertical grid lines
       // A horizontal line has consecutive dark pixels across > 60% of the box width
@@ -328,15 +341,11 @@ class ImagePreprocessor {
       for (let y = pxY + marginY; y < pxY + pxH - marginY; y++) {
         if (horizontalLineRows.has(y)) continue; // Keep printed underline!
 
-        // For narrative: line 1 starts cleanly after label NARRATIVE (x > 0.090 * pageWidth)
-        // subsequent lines start at 0.045 * pageWidth
         let lineStartX = pxX + marginX;
-        if (isNarrative) {
-          const isLine1 = (y - pxY) < pxH * 0.38;
-          if (isLine1) {
-            lineStartX = Math.max(lineStartX, Math.floor(0.123 * pageWidth));
-          } else {
-            lineStartX = Math.floor(0.045 * pageWidth);
+        if (isNarrative && field.bounds && field.bounds.width > 0.5) {
+          const isLine1 = (y - pxY) < pxH * 0.35;
+          if (isLine1 && field.label) {
+            lineStartX = Math.max(lineStartX, pxX + Math.min(pxW * 0.22, 100));
           }
         }
 

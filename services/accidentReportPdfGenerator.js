@@ -1,5 +1,6 @@
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 const { createCanvas } = require('@napi-rs/canvas');
+const { extractEarlyYearsFormModel } = require('./dynamicFormExtractor');
 
 /**
  * Accident Report Clean Master Vector PDF Generator
@@ -9,64 +10,35 @@ const { createCanvas } = require('@napi-rs/canvas');
 class AccidentReportPdfGenerator {
   static async generate(docData) {
     const fields = docData.fields || [];
-
-    const getByKey = (key, fallback = '') => {
-      const f = fields.find(item => item && item.fieldKey === key);
-      if (f && f.value !== undefined && f.value !== null && String(f.value).trim() !== '') {
-        return String(f.value).trim();
-      }
-      return fallback;
-    };
-
-    const getVal = (regex, fallback = '') => {
-      const hits = (fields || []).filter(item => item && item.label && regex.test(item.label));
-      for (const f of hits) {
-        if (f.value === undefined || f.value === null) continue;
-        const v = String(f.value).trim();
-        if (v) return v;
-      }
-      return fallback;
-    };
-
-    const isChecked = (keyOrRegex) => {
-      let f;
-      if (typeof keyOrRegex === 'string') {
-        f = fields.find(item => item && item.fieldKey === keyOrRegex);
-      } else {
-        f = fields.find(item => item && item.label && keyOrRegex.test(item.label) && (item.type === 'checkbox' || ['true', 'false'].includes(String(item.value).toLowerCase())));
-      }
-      if (!f || f.value === undefined || f.value === null) return false;
-      const v = String(f.value).toLowerCase().trim();
-      return ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(v);
-    };
-
-    const refNo = getByKey('refNo', getVal(/ref\s*no|reference/i, ''));
-    const formDate = getByKey('formDate', getVal(/^form date/i, ''));
-    const project = getByKey('projectName', getVal(/project name/i, ''));
-    const address = getByKey('bldgAddress', getVal(/building address/i, ''));
-
-    const name = getByKey('personName', getVal(/name of the person/i, ''));
-    const dob = getByKey('dob', getVal(/d\.o\.b|date of birth/i, ''));
-    const age = getByKey('age', getVal(/^age$/i, ''));
-    const regAddress = getByKey('regAddress', getVal(/registered address/i, ''));
-    const postcode = getByKey('postcode', getVal(/^postcode$/i, ''));
-    const contact = getByKey('contactNumber', getVal(/contact number/i, ''));
-    const adult = getByKey('responsibleAdult', getVal(/responsible adult/i, ''));
-    const session = getByKey('session', getVal(/session activity|^session$/i, ''));
-
-    const incDate = getByKey('incidentDate', getVal(/^incident date$/i, ''));
-    const incTime = getByKey('incidentTime', getVal(/incident time/i, ''));
-    const location = getByKey('location', getVal(/space\s*\/\s*location/i, ''));
-
-    const narrative = getVal(/narrative/i, '');
-    const completedBy = getVal(/completed by/i, '');
-    const position = getVal(/position/i, '');
-    const signature = getVal(/signature/i, '');
-    const dateSigned = getVal(/date signed/i, '');
-    const parentSigned = getVal(/parent signed|parent.*guardian/i, '');
-    const parentDate = getVal(/parent.*date/i, '');
-    const parentTime = getVal(/parent.*time/i, '');
-    const comments = getVal(/comments/i, '');
+    const model = extractEarlyYearsFormModel(fields);
+    const {
+      refNo,
+      formDate,
+      project,
+      address,
+      name,
+      dob,
+      age,
+      regAddress,
+      postcode,
+      contact,
+      adult,
+      session,
+      incDate,
+      incTime,
+      location,
+      narrative,
+      completedBy,
+      position,
+      signature,
+      dateSigned,
+      parentGuardianName,
+      parentSigned,
+      parentDate,
+      parentTime,
+      comments,
+      isChecked
+    } = model;
 
     // Create Canvas for high-res preview and vector PDF simultaneously
     const scale = 2;
@@ -300,19 +272,20 @@ class AccidentReportPdfGenerator {
     ], 21);
     y += 10;
 
-    // 4. RIDDOR ?
+    // 4. RIDDOR ? - only reportable if SEVERITY RIDDOR is selected
+    const isRiddorApplicable = isChecked('severityRiddor');
     drawBanner('RIDDOR ?');
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'DANGEROUS OCCURRENCE', checked: isChecked('riddorDangerous') },
-      { pct: 50, isCheckbox: true, label: 'REPORTABLE DISEASE', checked: isChecked('riddorDisease') }
+      { pct: 50, isCheckbox: true, label: 'DANGEROUS OCCURRENCE', checked: isRiddorApplicable && isChecked('riddorDangerous') },
+      { pct: 50, isCheckbox: true, label: 'REPORTABLE DISEASE', checked: isRiddorApplicable && isChecked('riddorDisease') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'INJURY TO PUBLIC', checked: isChecked('riddorPublic') },
-      { pct: 50, isCheckbox: true, label: 'INJURY 3 DAYS', checked: isChecked('riddor3Days') }
+      { pct: 50, isCheckbox: true, label: 'INJURY TO PUBLIC', checked: isRiddorApplicable && isChecked('riddorPublic') },
+      { pct: 50, isCheckbox: true, label: 'INJURY 3 DAYS', checked: isRiddorApplicable && isChecked('riddor3Days') }
     ], 20);
     drawGridRow([
-      { pct: 50, isCheckbox: true, label: 'MAJOR INJURY', checked: isChecked('riddorMajor') },
-      { pct: 50, isCheckbox: true, label: 'DEATH', checked: isChecked('riddorDeath') }
+      { pct: 50, isCheckbox: true, label: 'MAJOR INJURY', checked: isRiddorApplicable && isChecked('riddorMajor') },
+      { pct: 50, isCheckbox: true, label: 'DEATH', checked: isRiddorApplicable && isChecked('riddorDeath') }
     ], 20);
     y += 10;
 
@@ -405,7 +378,7 @@ class AccidentReportPdfGenerator {
     ctx.font = 'bold 8.5px "Segoe UI", Arial, sans-serif';
     ctx.textAlign = 'left';
 
-    const maxNarrW = 540;
+    const maxNarrW = contentW - 20;
     const narrWords = String(narrative || '').replace(/\r\n/g, ' ').replace(/\n/g, ' ').split(/\s+/).filter(Boolean);
     const narrDisplayLines = [];
     let currentLine = '';
@@ -447,9 +420,16 @@ class AccidentReportPdfGenerator {
       { pct: 20, isHdr: true, text: 'DATE' },
       { pct: 30, text: dateSigned }
     ], 21);
-    drawGridRow([
-      { pct: 100, isHdr: true, text: 'PARENT / GUARDIAN / RESPONSIBLE ADULT', align: 'center', bg: '#F1F5F9' }
-    ], 18);
+    if (parentGuardianName) {
+      drawGridRow([
+        { pct: 44, isHdr: true, text: 'PARENT / GUARDIAN / RESPONSIBLE ADULT', bg: '#F1F5F9' },
+        { pct: 56, text: parentGuardianName }
+      ], 19);
+    } else {
+      drawGridRow([
+        { pct: 100, isHdr: true, text: 'PARENT / GUARDIAN / RESPONSIBLE ADULT', align: 'center', bg: '#F1F5F9' }
+      ], 18);
+    }
     drawGridRow([
       { pct: 16, isHdr: true, text: 'SIGNED' },
       { pct: 28, text: parentSigned || '___________________', color: parentSigned ? '#1E40AF' : '#94A3B8' },
@@ -461,7 +441,7 @@ class AccidentReportPdfGenerator {
     drawGridRow([
       { pct: 20, isHdr: true, text: 'COMMENTS' },
       { pct: 80, text: comments || '' }
-    ], 21);
+    ], 25);
 
     // Convert Canvas to PNG Buffer
     const previewPng = canvas.toBuffer('image/png');

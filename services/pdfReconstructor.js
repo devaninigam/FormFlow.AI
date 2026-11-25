@@ -63,6 +63,10 @@ class PdfReconstructor {
         if (typeof b.x !== 'number' || typeof b.y !== 'number' || typeof b.width !== 'number' || typeof b.height !== 'number' || isNaN(b.x) || isNaN(b.y) || isNaN(b.width) || isNaN(b.height)) {
           continue;
         }
+        // If bounds are dummy/fallback positions, do not draw onto the page
+        if (b.isFallback || b.width <= 0 || b.height <= 0 || (b.x === 0.1 && b.y === 0.3) || (b.x === 0.1 && b.y === 0.1)) {
+          continue;
+        }
         const val = (field.value !== undefined && field.value !== null) ? String(field.value).trim() : '';
         if (!val || field.isBlank) continue;
 
@@ -130,9 +134,9 @@ class PdfReconstructor {
           : Math.min(10, Math.max(8.5, boxH * 0.72));
         if (isNaN(fontSize) || fontSize <= 0) fontSize = 9.5;
 
-        const isNarrative = field.label && field.label.toLowerCase().includes('narrative');
+        const isEarlyYearsNarrative = (options.formLayout === 'early_years_accident' || (b.x < 0.15 && b.width > 0.7)) && field.label && field.label.toLowerCase().includes('narrative');
 
-        if (isNarrative) {
+        if (isEarlyYearsNarrative) {
           // Dynamic word wrap across 3 ruled lines strictly within narrative text column
           const tableRight = Math.round(0.926 * pdfWidth);
           const narrPdfX = Math.round(0.193 * pdfWidth); // Starts cleanly after printed "NARRATIVE" column

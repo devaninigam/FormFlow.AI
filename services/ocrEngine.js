@@ -39,6 +39,9 @@ class OcrEngine {
    */
   static async analyzeDocument(pages, options = {}) {
     const provider = options.provider || 'auto';
+    const awsAccessKey = options.awsAccessKey || process.env.AWS_ACCESS_KEY_ID;
+    const awsSecretKey = options.awsSecretKey || process.env.AWS_SECRET_ACCESS_KEY;
+    const awsRegion = options.awsRegion || process.env.AWS_REGION || 'us-east-1';
     const azureKey = options.azureKey || process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY;
     const azureEndpoint = options.azureEndpoint || process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT;
     const geminiKey = options.geminiKey || options.apiKey || process.env.GEMINI_API_KEY;
@@ -46,7 +49,9 @@ class OcrEngine {
 
     let selectedProvider = provider;
     if (provider === 'auto') {
-      if (azureKey && azureEndpoint) {
+      if (awsAccessKey && awsSecretKey) {
+        selectedProvider = 'aws';
+      } else if (azureKey && azureEndpoint) {
         selectedProvider = 'azure';
       } else if (geminiKey) {
         selectedProvider = 'gemini';
@@ -58,7 +63,9 @@ class OcrEngine {
     }
 
     try {
-      if (selectedProvider === 'azure' && azureKey && azureEndpoint) {
+      if ((selectedProvider === 'aws' || selectedProvider === 'textract') && awsAccessKey && awsSecretKey) {
+        return await this.analyzeWithAwsTextract(pages, { accessKeyId: awsAccessKey, secretAccessKey: awsSecretKey, region: awsRegion });
+      } else if (selectedProvider === 'azure' && azureKey && azureEndpoint) {
         return await this.analyzeWithAzure(pages, azureEndpoint, azureKey);
       } else if (selectedProvider === 'gemini' && geminiKey) {
         return await this.analyzeWithGemini(pages, geminiKey);
@@ -76,6 +83,255 @@ class OcrEngine {
       }
       throw err;
     }
+  }
+
+  /**
+   * 0. AWS Textract Document Analysis (FORMS, TABLES, and SELECTION_ELEMENTS)
+   */
+  static async analyzeWithAwsTextract(pages, credentials = {}) {
+    const { TextractClient, AnalyzeDocumentCommand } = require('@aws-sdk/client-textract');
+
+    const client = new TextractClient({
+      region: credentials.region || process.env.AWS_REGION || 'us-east-1',
+      credentials: {
+        accessKeyId: credentials.accessKeyId || process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: credentials.secretAccessKey || process.env.AWS_SECRET_ACCESS_KEY
+      }
+    });
+
+    const allFields = [];
+    const allTables = [];
+    let fieldCounter = 1;
+    let tableCounter = 1;
+    let combinedFullText = '';
+
+    for (let pIdx = 0; pIdx < pages.length; pIdx++) {
+      const page = pages[pIdx];
+      const pageNum = page.pageNumber || (pIdx + 1);
+
+      const command = new AnalyzeDocumentCommand({
+        Document: { Bytes: page.buffer },
+        FeatureTypes: ['FORMS', 'TABLES']
+      });
+
+      const response = await client.send(command);
+      const blocks = response.Blocks || [];
+
+      // Build quick lookup map by ID
+      const blockMap = new Map();
+      blocks.forEach(b => blockMap.set(b.Id, b));
+
+      const getText = (block) => {
+        if (!block || !block.Relationships) return '';
+        let text = '';
+        for (const rel of block.Relationships) {
+          if (rel.Type === 'CHILD') {
+            for (const cid of rel.Ids) {
+              const child = blockMap.get(cid);
+              if (child && child.BlockType === 'WORD') {
+                text += (text ? ' ' : '') + child.Text;
+              }
+            }
+          }
+        }
+        return text;
+      };
+
+      const getCheckState = (block) => {
+        if (!block || !block.Relationships) return null;
+        for (const rel of block.Relationships) {
+          if (rel.Type === 'CHILD') {
+            for (const cid of rel.Ids) {
+              const child = blockMap.get(cid);
+              if (child && child.BlockType === 'SELECTION_ELEMENT') {
+                return child.SelectionStatus === 'SELECTED';
+              }
+            }
+          }
+        }
+        return null;
+      };
+
+      let pageFullText = '';
+
+      // 1. Extract Key-Value Pairs
+      const pageFields = [];
+      for (const block of blocks) {
+        if (block.BlockType === 'LINE') {
+          combinedFullText += ' ' + block.Text;
+          pageFullText += (pageFullText ? '\n' : '') + block.Text;
+        }
+
+        if (block.BlockType === 'KEY_VALUE_SET' && block.EntityTypes?.includes('KEY')) {
+          const keyText = getText(block);
+          if (!keyText || keyText.length < 2) continue;
+
+          let valBlock = null;
+          if (block.Relationships) {
+            for (const rel of block.Relationships) {
+              if (rel.Type === 'VALUE') {
+                valBlock = blockMap.get(rel.Ids[0]);
+                break;
+              }
+            }
+          }
+
+          let valText = '';
+          let isCheckbox = false;
+          let isChecked = false;
+          let bounds = null;
+
+          if (valBlock) {
+            const check = getCheckState(valBlock);
+            if (check !== null) {
+              isCheckbox = true;
+              isChecked = check;
+              valText = isChecked ? 'true' : 'false';
+            } else {
+              valText = getText(valBlock);
+            }
+
+            if (valBlock.Geometry?.BoundingBox) {
+              const bb = valBlock.Geometry.BoundingBox;
+              bounds = {
+                x: Number(Math.max(0, bb.Left).toFixed(4)),
+                y: Number(Math.max(0, bb.Top).toFixed(4)),
+                width: Number(Math.min(1, bb.Width).toFixed(4)),
+                height: Number(Math.min(1, bb.Height).toFixed(4))
+              };
+            }
+          }
+
+          if (!bounds && block.Geometry?.BoundingBox) {
+            const bb = block.Geometry.BoundingBox;
+            bounds = {
+              x: Number(Math.min(0.9, bb.Left + bb.Width + 0.02).toFixed(4)),
+              y: Number(bb.Top.toFixed(4)),
+              width: Number(Math.min(0.4, 0.95 - (bb.Left + bb.Width)).toFixed(4)),
+              height: Number(bb.Height.toFixed(4))
+            };
+          }
+
+          const conf = block.Confidence ? Number((block.Confidence / 100).toFixed(2)) : 0.85;
+          const cleanLabel = keyText.trim().replace(/^:+|:+$/g, '').replace(/_+$/, '').trim();
+          const trimmedVal = String(valText || '').trim();
+
+          // Skip top-header printed glossary definition bullets mistaken as form fields
+          if (
+            !isCheckbox &&
+            (bounds?.y ?? 1) < 0.21 &&
+            /^(child\s*accident|child\s*incident|accident|near\s*miss|incident)$/i.test(cleanLabel) &&
+            /unintended injury|intended injury|unplanned event|discrete,?\s*identifiable|does not cause injury/i.test(trimmedVal)
+          ) {
+            continue;
+          }
+
+          pageFields.push({
+            id: `field_${fieldCounter++}`,
+            label: cleanLabel,
+            value: isCheckbox ? (isChecked ? 'true' : 'false') : trimmedVal,
+            originalOcrValue: isCheckbox ? (isChecked ? '[X] Checked' : '[ ] Unchecked') : trimmedVal,
+            page: pageNum,
+            confidence: conf,
+            verified: conf >= 0.88,
+            needsVerification: conf < 0.88,
+            isUnreadable: conf < 0.45,
+            isBlank: !trimmedVal,
+            type: isCheckbox ? 'checkbox' : this.detectFieldType(cleanLabel, trimmedVal),
+            bounds: bounds || { x: 0.1, y: 0.1, width: 0.3, height: 0.02 },
+            isHandwritten: true,
+            source: 'aws_textract'
+          });
+        }
+      }
+
+      // Split composite header dates like "05-03-26 Riverside Nursery" only if Project Name wasn't already extracted
+      const hasProjectField = pageFields.some(f => /project\s*name/i.test(f.label) && f.value);
+      for (const f of [...pageFields]) {
+        if (/^date$/i.test(f.label) && typeof f.value === 'string') {
+          const dateMatch = f.value.match(/^(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(.+)$/);
+          if (dateMatch) {
+            f.value = dateMatch[1].trim();
+            f.originalOcrValue = f.value;
+            if (!hasProjectField) {
+              const trailingProject = dateMatch[2].trim();
+              pageFields.push({
+                id: `field_${fieldCounter++}`,
+                label: 'Project Name',
+                value: trailingProject,
+                originalOcrValue: trailingProject,
+                page: pageNum,
+                confidence: f.confidence,
+                verified: f.confidence >= 0.88,
+                needsVerification: f.confidence < 0.88,
+                isUnreadable: false,
+                isBlank: false,
+                type: 'text',
+                bounds: f.bounds ? { ...f.bounds, x: Number((f.bounds.x + 0.18).toFixed(4)), width: Number((f.bounds.width * 0.6).toFixed(4)) } : null,
+                isHandwritten: true,
+                source: 'aws_textract'
+              });
+            }
+          }
+        }
+      }
+
+      pageFields.sort((a, b) => {
+        const yDiff = (a.bounds?.y ?? 1) - (b.bounds?.y ?? 1);
+        if (Math.abs(yDiff) > 0.005) return yDiff;
+        return (a.bounds?.x ?? 0) - (b.bounds?.x ?? 0);
+      });
+
+      allFields.push(...pageFields);
+      page.fullText = pageFullText.trim();
+
+      // 2. Extract Tables
+      for (const block of blocks) {
+        if (block.BlockType === 'TABLE' && block.Relationships) {
+          const cells = [];
+          for (const rel of block.Relationships) {
+            if (rel.Type === 'CHILD') {
+              for (const cid of rel.Ids) {
+                const cell = blockMap.get(cid);
+                if (cell && cell.BlockType === 'CELL') {
+                  cells.push({
+                    row: cell.RowIndex,
+                    col: cell.ColumnIndex,
+                    text: getText(cell)
+                  });
+                }
+              }
+            }
+          }
+
+          if (cells.length > 0) {
+            const rowMap = new Map();
+            cells.forEach(c => {
+              if (!rowMap.has(c.row)) rowMap.set(c.row, []);
+              rowMap.get(c.row)[c.col - 1] = c.text;
+            });
+            const sortedRows = Array.from(rowMap.entries())
+              .sort((a, b) => a[0] - b[0])
+              .map(entry => entry[1]);
+
+            if (sortedRows.length >= 2) {
+              allTables.push({
+                id: `table_${tableCounter++}`,
+                page: pageNum,
+                headers: sortedRows[0] || [],
+                rows: sortedRows.slice(1) || [],
+                confidence: 0.9
+              });
+            }
+          }
+        }
+      }
+    }
+
+    const docType = DynamicExtractor.classifyDocumentType([], combinedFullText);
+    const layoutHint = docType === 'early_years_accident' ? 'early_years_accident' : 'dynamic';
+
+    return this.assembleFinalOutput('aws_textract', pages, allFields, allTables, layoutHint);
   }
 
   /**
@@ -210,103 +466,79 @@ class OcrEngine {
       }
     }
 
-    if (DynamicExtractor.looksLikeAccidentVisionPayload({ fields })) {
+    const isAccident = DynamicExtractor.isEarlyYearsAccident && DynamicExtractor.isEarlyYearsAccident({ fields });
+    if (isAccident && typeof this.resultFromAccidentVision === 'function') {
       return this.resultFromAccidentVision('azure', pages, { fields, isAccidentIncidentForm: true });
     }
 
     return this.assembleFinalOutput('azure', pages, fields, tables);
   }
 
-  static accidentFormVisionPrompt() {
-    return `You are reading an ACCIDENT & INCIDENT REPORT FORM (Early Years).
-First read ALL printed labels and ALL handwritten/typed answers in the image.
-Then fill ONLY the JSON keys below. Each value must come from THAT box only.
+  static genericDocumentVisionPrompt() {
+    return `You are an expert document understanding and data extraction AI.
+Analyze the provided document image thoroughly and accurately. Read all printed text, handwritten entries, checkboxes, stamps, signatures, numbers, dates, codes, and table grids.
 
-Rules:
-- Convert handwriting as accurately as you can.
-- If a box is blank or unreadable, use "" or false. Never invent.
-- Do not copy a date from one DATE box into another (form date ≠ D.O.B. ≠ incident date ≠ signed date) unless the writing in that box is truly the same.
-- Ref No is an ID (letters/digits/hyphens), never a date or phone.
-- Contact Number is a phone only. Postcode is a UK postcode only.
-- PROJECT NAME is the centre/project cell, not a child-status checkbox.
-- Checkboxes: true only if that option has a real tick/cross; otherwise false.
-- comments must not be a copy of narrative.
+Extraction Guidelines:
+1. Identify the genuine document type (e.g. "invoice", "receipt", "medical_intake", "equipment_inspection", "accident_incident_report", "contract", "tax_form", "generic_form").
+2. Extract all key-value pairs and input fields:
+   - "label": The printed or intended label of the field (clean, trimmed).
+   - "value": The actual filled, typed, or handwritten value in that field. If empty, blank, or unchecked, use "".
+   - "type": "text" | "number" | "date" | "address" | "checkbox" | "multiline".
+   - "confidence": Float between 0.0 and 1.0 reflecting handwriting/text legibility.
+   - "bounds": Estimated normalized bounding box { "x": float, "y": float, "width": float, "height": float } between 0.0 and 1.0 relative to page width and height. If unknown or not localized, omit bounds.
+   - "isHandwritten": boolean (true if value is handwritten or hand-marked, false if printed).
+   - "section": Category or section heading where this field appears (e.g. "Patient Identification", "Invoice Summary", "Sign-Off").
+3. Detect all checkboxes and selection marks:
+   - "label": The text label describing the checkbox option (e.g. "Male", "Female", "Yes", "No", "Pass", "Fail", "Morning", "Accident").
+   - "checked": boolean (true if marked, ticked, crossed, or filled; false if empty or unselected).
+   - "confidence": Float between 0.0 and 1.0.
+   - "bounds": { "x", "y", "width", "height" } normalized coordinates.
+4. Extract all tables:
+   - "title": Table title or heading if any.
+   - "headers": Array of column header strings.
+   - "rows": 2D array of string values for each row and column [[col1, col2, ...], ...].
+   - "bounds": { "x", "y", "width", "height" } of the table area.
+5. Absolute rules:
+   - NEVER invent, hallucinate, or assume missing values.
+   - If a box or line is blank, return "" for its value.
+   - Accurately preserve numbers, dates, references, currency, phone numbers, and codes exactly as written.
 
-Return ONLY JSON:
+Return strictly valid JSON matching this structure:
 {
-  "isAccidentIncidentForm": true,
-  "values": {
-    "refNo": "",
-    "formDate": "",
-    "projectName": "",
-    "bldgAddress": "",
-    "personName": "",
-    "dob": "",
-    "regAddress": "",
-    "postcode": "",
-    "contactNumber": "",
-    "responsibleAdult": "",
-    "session": "",
-    "incidentDate": "",
-    "incidentTime": "",
-    "location": "",
-    "narrative": "",
-    "completedBy": "",
-    "position": "",
-    "signature": "",
-    "dateSigned": "",
-    "parentSignature": "",
-    "parentSignDate": "",
-    "parentSignTime": "",
-    "comments": ""
-  },
-  "checks": {
-    "staffEy": false,
-    "staffNonEy": false,
-    "staffVisitor": false,
-    "staffParent": false,
-    "childDaycare": false,
-    "childToybox": false,
-    "childSurestart": false,
-    "typeAccident": false,
-    "typeIncident": false,
-    "typeNearMiss": false,
-    "severityRiddor": false,
-    "severityModerate": false,
-    "severityMinor": false,
-    "riddorDangerous": false,
-    "riddorDisease": false,
-    "riddorPublic": false,
-    "riddor3Days": false,
-    "riddorMajor": false,
-    "riddorDeath": false,
-    "causePeer": false,
-    "causeEquip": false,
-    "causeUnknown": false,
-    "causeSlip": false,
-    "causeCoshh": false,
-    "causeTraffic": false,
-    "causeManual": false,
-    "causeChoking": false,
-    "causeVenue": false,
-    "injuryCut": false,
-    "injuryBruise": false,
-    "injuryStrain": false,
-    "injuryFracture": false,
-    "injuryHead": false,
-    "injurySensory": false,
-    "injuryConscious": false,
-    "injuryOrgan": false,
-    "injuryProperty": false,
-    "injuryDistress": false,
-    "outcomeReturn": false,
-    "outcomeFirstAid": false,
-    "outcomeAdultCare": false,
-    "outcomeNias": false,
-    "outcomeHospital": false,
-    "outcomeSupport": false
-  }
+  "documentType": "string",
+  "documentTitle": "string",
+  "fields": [
+    {
+      "label": "string",
+      "value": "string",
+      "type": "text",
+      "confidence": 0.95,
+      "bounds": { "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.04 },
+      "isHandwritten": false,
+      "section": "General"
+    }
+  ],
+  "checkboxes": [
+    {
+      "label": "string",
+      "checked": false,
+      "confidence": 0.9,
+      "bounds": { "x": 0.1, "y": 0.3, "width": 0.03, "height": 0.03 }
+    }
+  ],
+  "tables": [
+    {
+      "title": "string",
+      "headers": ["Header 1", "Header 2"],
+      "rows": [["Cell 1", "Cell 2"]],
+      "bounds": { "x": 0.1, "y": 0.4, "width": 0.8, "height": 0.2 }
+    }
+  ]
 }`;
+  }
+
+  static accidentFormVisionPrompt() {
+    return this.genericDocumentVisionPrompt();
   }
 
   static async encodePageForVision(pageBuffer) {
@@ -332,140 +564,329 @@ Return ONLY JSON:
 
   /**
    * 2. Vision-Language Model Interpretation (Google Gemini Vision)
-   * Accident & Incident form: structured A–Z boxes from handwriting.
+   * Generic, schema-agnostic extraction across arbitrary document pages.
    */
   static async analyzeWithGemini(pages, apiKey) {
-    const visionBuf = await this.encodePageForVision(pages[0].buffer);
-    const base64Image = visionBuf.toString('base64');
-    const prompt = this.accidentFormVisionPrompt();
-    const models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
+    const allFields = [];
+    const allTables = [];
+    let fieldCounter = 1;
+    let tableCounter = 1;
+    let detectedDocumentType = 'dynamic';
+    const models = ['gemini-2.0-flash', 'gemini-1.5-flash'];
 
-    let lastErr = null;
-    let parsed = null;
-    for (const model of models) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: 'image/png', data: base64Image } }
-            ]
-          }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.1
+    for (let pIdx = 0; pIdx < pages.length; pIdx++) {
+      const page = pages[pIdx];
+      const pageNum = page.pageNumber || (pIdx + 1);
+      const visionBuf = await this.encodePageForVision(page.buffer);
+      const base64Image = visionBuf.toString('base64');
+      const prompt = this.genericDocumentVisionPrompt();
+
+      let lastErr = null;
+      let parsed = null;
+
+      for (const model of models) {
+        try {
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  { text: prompt },
+                  { inlineData: { mimeType: 'image/png', data: base64Image } }
+                ]
+              }],
+              generationConfig: {
+                responseMimeType: 'application/json',
+                temperature: 0.1
+              }
+            })
+          });
+
+          if (!response.ok) {
+            const errText = await response.text();
+            lastErr = new Error(`Gemini (${model}) API error: ${response.status} - ${errText}`);
+            continue;
           }
-        })
-      });
-      if (!response.ok) {
-        lastErr = new Error(`Gemini API error: ${response.status} - ${await response.text()}`);
+
+          const jsonRes = await response.json();
+          const candidateText = jsonRes.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!candidateText) {
+            lastErr = new Error(`Empty response from Gemini (${model})`);
+            continue;
+          }
+
+          parsed = JSON.parse(candidateText);
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+
+      if (!parsed) {
+        console.warn(`Gemini analysis on page ${pageNum} encountered an error:`, lastErr?.message);
         continue;
       }
-      const jsonRes = await response.json();
-      const candidateText = jsonRes.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!candidateText) {
-        lastErr = new Error('Empty response from Gemini');
+
+      if (parsed.documentType && detectedDocumentType === 'dynamic') {
+        detectedDocumentType = parsed.documentType;
+      }
+
+      // Check if this page is specifically an Early Years Accident form
+      const isEyAccident = pIdx === 0 && (
+        parsed.documentType === 'early_years_accident' ||
+        (DynamicExtractor.isEarlyYearsAccident && DynamicExtractor.isEarlyYearsAccident(parsed))
+      );
+
+      if (isEyAccident && typeof DynamicExtractor.buildEarlyYearsFormFieldsFromVision === 'function') {
+        const ey = DynamicExtractor.buildEarlyYearsFormFieldsFromVision(parsed, {
+          pageNum,
+          startCounter: fieldCounter
+        });
+        allFields.push(...ey.fields);
+        fieldCounter += ey.fields.length;
+        detectedDocumentType = 'early_years_accident';
+        page.fullText = page.fullText || JSON.stringify(parsed.values || {});
         continue;
       }
-      parsed = JSON.parse(candidateText);
-      break;
+
+      // 1. Generic Fields
+      for (const f of parsed.fields || []) {
+        const val = f.value !== undefined && f.value !== null ? String(f.value).trim() : '';
+        const conf = typeof f.confidence === 'number' ? Math.max(0.1, Math.min(1.0, f.confidence)) : 0.88;
+        const isBlank = !val;
+        const b = (f.bounds && typeof f.bounds.x === 'number') ? {
+          x: Number(f.bounds.x.toFixed(4)),
+          y: Number(f.bounds.y.toFixed(4)),
+          width: Number(f.bounds.width.toFixed(4)),
+          height: Number(f.bounds.height.toFixed(4))
+        } : null;
+
+        allFields.push({
+          id: `field_${fieldCounter++}`,
+          label: f.label || `Field ${fieldCounter}`,
+          value: val,
+          originalOcrValue: val,
+          page: pageNum,
+          section: f.section || 'Extracted Fields',
+          confidence: Number(conf.toFixed(3)),
+          verified: conf >= 0.88,
+          needsVerification: !isBlank && conf < 0.85,
+          isUnreadable: !!f.isUnreadable || (!isBlank && conf < 0.5),
+          isBlank,
+          type: f.type || this.detectFieldType(f.label, val),
+          bounds: b,
+          isHandwritten: f.isHandwritten !== undefined ? !!f.isHandwritten : false,
+          source: 'gemini_vision'
+        });
+      }
+
+      // 2. Generic Checkboxes
+      for (const cb of parsed.checkboxes || []) {
+        const checked = cb.checked === true || ['true', 'yes', '1', 'checked'].includes(String(cb.value || '').toLowerCase());
+        const conf = typeof cb.confidence === 'number' ? Math.max(0.1, Math.min(1.0, cb.confidence)) : 0.88;
+        const b = (cb.bounds && typeof cb.bounds.x === 'number') ? {
+          x: Number(cb.bounds.x.toFixed(4)),
+          y: Number(cb.bounds.y.toFixed(4)),
+          width: Number(cb.bounds.width.toFixed(4)),
+          height: Number(cb.bounds.height.toFixed(4))
+        } : null;
+
+        allFields.push({
+          id: `field_${fieldCounter++}`,
+          label: cb.label || 'Checkbox',
+          value: checked ? 'true' : 'false',
+          originalOcrValue: checked ? '[X] Checked' : '[ ] Unchecked',
+          page: pageNum,
+          section: cb.section || 'Options',
+          confidence: Number(conf.toFixed(3)),
+          verified: conf >= 0.88,
+          needsVerification: conf < 0.85,
+          isUnreadable: false,
+          isBlank: false,
+          type: 'checkbox',
+          bounds: b,
+          isHandwritten: true,
+          source: 'gemini_checkbox'
+        });
+      }
+
+      // 3. Generic Tables
+      for (const tbl of parsed.tables || []) {
+        const b = (tbl.bounds && typeof tbl.bounds.x === 'number') ? {
+          x: Number(tbl.bounds.x.toFixed(4)),
+          y: Number(tbl.bounds.y.toFixed(4)),
+          width: Number(tbl.bounds.width.toFixed(4)),
+          height: Number(tbl.bounds.height.toFixed(4))
+        } : null;
+
+        allTables.push({
+          id: `table_${tableCounter++}`,
+          page: pageNum,
+          title: tbl.title || `Detected Table ${tableCounter - 1}`,
+          headers: Array.isArray(tbl.headers) ? tbl.headers : [],
+          rows: Array.isArray(tbl.rows) ? tbl.rows : [],
+          bounds: b,
+          source: 'gemini_table'
+        });
+      }
+
+      page.fullText = (parsed.fields || []).map(f => `${f.label}: ${f.value}`).join('\n');
     }
-    if (!parsed) throw lastErr || new Error('Gemini analysis failed');
 
-    if (DynamicExtractor.looksLikeAccidentVisionPayload(parsed)) {
-      return this.resultFromAccidentVision('gemini', pages, parsed);
+    if (allFields.length === 0 && pages.length > 0) {
+      throw new Error('Gemini vision analysis yielded no fields; falling back to local engine');
     }
 
-    const fields = (parsed.fields || []).map((f, i) => ({
-      id: `field_${i + 1}`,
-      label: f.label || `Field ${i + 1}`,
-      value: f.value || '',
-      originalOcrValue: f.value || '',
-      page: 1,
-      confidence: typeof f.confidence === 'number' ? f.confidence : 0.88,
-      verified: (f.confidence || 0.88) >= 0.88,
-      needsVerification: (f.confidence || 0.88) < 0.85 && (f.confidence || 0.88) >= 0.5,
-      isUnreadable: !!f.isUnreadable || (f.confidence || 0.88) < 0.5,
-      isBlank: !f.value,
-      type: f.type || this.detectFieldType(f.label, f.value),
-      bounds: f.bounds || { x: 0.2, y: 0.1 + (i * 0.05), width: 0.4, height: 0.04 },
-      isHandwritten: f.isHandwritten !== undefined ? f.isHandwritten : true
-    }));
-
-    const tables = (parsed.tables || []).map((t, idx) => ({
-      id: `table_${idx + 1}`,
-      page: 1,
-      title: t.title || `Detected Table ${idx + 1}`,
-      bounds: t.bounds || { x: 0.1, y: 0.5, width: 0.8, height: 0.25 },
-      headers: t.headers || [],
-      rows: t.rows || []
-    }));
-
-    return this.assembleFinalOutput('gemini', pages, fields, tables);
+    return this.assembleFinalOutput('gemini', pages, allFields, allTables, detectedDocumentType);
   }
 
   /**
    * 3. Vision-Language Model Interpretation (OpenAI Vision)
-   * Accident & Incident form: structured A–Z boxes from handwriting.
+   * Generic, schema-agnostic extraction across arbitrary document pages.
    */
   static async analyzeWithOpenAI(pages, apiKey) {
-    const visionBuf = await this.encodePageForVision(pages[0].buffer);
-    const base64Image = visionBuf.toString('base64');
-    const prompt = this.accidentFormVisionPrompt();
+    const allFields = [];
+    const allTables = [];
+    let fieldCounter = 1;
+    let tableCounter = 1;
+    let detectedDocumentType = 'dynamic';
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: `data:image/png;base64,${base64Image}` } }
-          ]
-        }],
-        response_format: { type: 'json_object' },
-        temperature: 0.1
-      })
-    });
+    for (let pIdx = 0; pIdx < pages.length; pIdx++) {
+      const page = pages[pIdx];
+      const pageNum = page.pageNumber || (pIdx + 1);
+      const visionBuf = await this.encodePageForVision(page.buffer);
+      const base64Image = visionBuf.toString('base64');
+      const prompt = this.genericDocumentVisionPrompt();
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${errText}`);
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: `data:image/png;base64,${base64Image}` } }
+            ]
+          }],
+          response_format: { type: 'json_object' },
+          temperature: 0.1
+        })
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`OpenAI API error: ${response.status} - ${errText}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+      const parsed = JSON.parse(content || '{}');
+
+      if (parsed.documentType && detectedDocumentType === 'dynamic') {
+        detectedDocumentType = parsed.documentType;
+      }
+
+      const isEyAccident = pIdx === 0 && (
+        parsed.documentType === 'early_years_accident' ||
+        (DynamicExtractor.isEarlyYearsAccident && DynamicExtractor.isEarlyYearsAccident(parsed))
+      );
+
+      if (isEyAccident && typeof DynamicExtractor.buildEarlyYearsFormFieldsFromVision === 'function') {
+        const ey = DynamicExtractor.buildEarlyYearsFormFieldsFromVision(parsed, {
+          pageNum,
+          startCounter: fieldCounter
+        });
+        allFields.push(...ey.fields);
+        fieldCounter += ey.fields.length;
+        detectedDocumentType = 'early_years_accident';
+        page.fullText = page.fullText || JSON.stringify(parsed.values || {});
+        continue;
+      }
+
+      for (const f of parsed.fields || []) {
+        const val = f.value !== undefined && f.value !== null ? String(f.value).trim() : '';
+        const conf = typeof f.confidence === 'number' ? Math.max(0.1, Math.min(1.0, f.confidence)) : 0.88;
+        const isBlank = !val;
+        const b = (f.bounds && typeof f.bounds.x === 'number') ? {
+          x: Number(f.bounds.x.toFixed(4)),
+          y: Number(f.bounds.y.toFixed(4)),
+          width: Number(f.bounds.width.toFixed(4)),
+          height: Number(f.bounds.height.toFixed(4))
+        } : null;
+
+        allFields.push({
+          id: `field_${fieldCounter++}`,
+          label: f.label || `Field ${fieldCounter}`,
+          value: val,
+          originalOcrValue: val,
+          page: pageNum,
+          section: f.section || 'Extracted Fields',
+          confidence: Number(conf.toFixed(3)),
+          verified: conf >= 0.88,
+          needsVerification: !isBlank && conf < 0.85,
+          isUnreadable: !!f.isUnreadable || (!isBlank && conf < 0.5),
+          isBlank,
+          type: f.type || this.detectFieldType(f.label, val),
+          bounds: b,
+          isHandwritten: f.isHandwritten !== undefined ? !!f.isHandwritten : false,
+          source: 'openai_vision'
+        });
+      }
+
+      for (const cb of parsed.checkboxes || []) {
+        const checked = cb.checked === true || ['true', 'yes', '1', 'checked'].includes(String(cb.value || '').toLowerCase());
+        const conf = typeof cb.confidence === 'number' ? Math.max(0.1, Math.min(1.0, cb.confidence)) : 0.88;
+        const b = (cb.bounds && typeof cb.bounds.x === 'number') ? {
+          x: Number(cb.bounds.x.toFixed(4)),
+          y: Number(cb.bounds.y.toFixed(4)),
+          width: Number(cb.bounds.width.toFixed(4)),
+          height: Number(cb.bounds.height.toFixed(4))
+        } : null;
+
+        allFields.push({
+          id: `field_${fieldCounter++}`,
+          label: cb.label || 'Checkbox',
+          value: checked ? 'true' : 'false',
+          originalOcrValue: checked ? '[X] Checked' : '[ ] Unchecked',
+          page: pageNum,
+          section: cb.section || 'Options',
+          confidence: Number(conf.toFixed(3)),
+          verified: conf >= 0.88,
+          needsVerification: conf < 0.85,
+          isUnreadable: false,
+          isBlank: false,
+          type: 'checkbox',
+          bounds: b,
+          isHandwritten: true,
+          source: 'openai_checkbox'
+        });
+      }
+
+      for (const tbl of parsed.tables || []) {
+        allTables.push({
+          id: `table_${tableCounter++}`,
+          page: pageNum,
+          title: tbl.title || `Detected Table ${tableCounter - 1}`,
+          headers: Array.isArray(tbl.headers) ? tbl.headers : [],
+          rows: Array.isArray(tbl.rows) ? tbl.rows : [],
+          bounds: (tbl.bounds && typeof tbl.bounds.x === 'number') ? tbl.bounds : null,
+          source: 'openai_table'
+        });
+      }
     }
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-    const parsed = JSON.parse(content);
-
-    if (DynamicExtractor.looksLikeAccidentVisionPayload(parsed)) {
-      return this.resultFromAccidentVision('openai', pages, parsed);
+    if (allFields.length === 0 && pages.length > 0) {
+      throw new Error('OpenAI vision analysis yielded no fields; falling back to local engine');
     }
 
-    const fields = (parsed.fields || []).map((f, i) => ({
-      id: `field_${i + 1}`,
-      label: f.label || `Field ${i + 1}`,
-      value: f.value || '',
-      originalOcrValue: f.value || '',
-      page: 1,
-      confidence: typeof f.confidence === 'number' ? f.confidence : 0.88,
-      verified: (f.confidence || 0.88) >= 0.88,
-      needsVerification: (f.confidence || 0.88) < 0.85 && (f.confidence || 0.88) >= 0.5,
-      isUnreadable: !!f.isUnreadable || (f.confidence || 0.88) < 0.5,
-      isBlank: !f.value,
-      type: f.type || this.detectFieldType(f.label, f.value),
-      bounds: f.bounds || { x: 0.2, y: 0.1 + (i * 0.05), width: 0.4, height: 0.04 },
-      isHandwritten: f.isHandwritten !== undefined ? f.isHandwritten : true
-    }));
-
-    return this.assembleFinalOutput('openai', pages, fields, parsed.tables || []);
+    return this.assembleFinalOutput('openai', pages, allFields, allTables, detectedDocumentType);
   }
 
   /**
@@ -524,434 +945,66 @@ Return ONLY JSON:
   }
 
   /**
-   * Re-OCR the handwritten value cell immediately to the right of a printed label.
-   * Uses single-line PSM so names/dates/phones are not mixed into neighbouring boxes.
-   */
-  static async recognizeLabelValueCells(worker, srcBuffer, width, height, lines) {
-    const specs = [
-      { re: /ref\s*no/i, widthPct: 0.22, yPad: 4 },
-      { re: /name of the person/i, widthPct: 0.42, yPad: 3 },
-      { re: /\bd\.?o\.?b\b/i, widthPct: 0.22, yPad: 3 },
-      { re: /registered address/i, widthPct: 0.48, yPad: 6 },
-      { re: /postcode/i, widthPct: 0.20, yPad: 3 },
-      { re: /contact number/i, widthPct: 0.32, yPad: 3 },
-      { re: /responsible adult/i, widthPct: 0.32, yPad: 3 },
-      { re: /\bsession\b/i, widthPct: 0.55, yPad: 4 },
-      { re: /about the incident/i, widthPct: 0.90, below: true, heightPct: 0.042 }
-    ];
-
-    const out = [];
-    const seen = new Set();
-
-    for (const spec of specs) {
-      const line = (lines || []).find(l => spec.re.test(l.text || '') && l.bbox);
-      if (!line) continue;
-
-      const bb = line.bbox;
-      let labelRight = bb.x0;
-      if (line.words && line.words.length) {
-        const hits = line.words.filter(w => spec.re.test(w.text || ''));
-        const last = hits.length ? hits[hits.length - 1] : null;
-        if (last && last.bbox) labelRight = last.bbox.x1;
-        else {
-          // Label may span several short words ("Name of the person involved")
-          const joined = line.words.map(w => w.text).join(' ');
-          if (spec.re.test(joined) && line.words[0].bbox) {
-            const approx = Math.min(line.words.length, 5);
-            const w = line.words[Math.max(0, approx - 1)];
-            labelRight = w.bbox ? w.bbox.x1 : bb.x0 + 80;
-          }
-        }
-      } else {
-        labelRight = bb.x0 + Math.min(220, Math.max(60, (bb.x1 - bb.x0) * 0.28));
-      }
-
-      let left;
-      let top;
-      let cropW;
-      let cropH;
-
-      if (spec.below) {
-        left = Math.max(0, Math.round(bb.x0));
-        top = Math.max(0, Math.round(bb.y1));
-        cropW = Math.min(width - left, Math.round(width * spec.widthPct));
-        cropH = Math.min(height - top, Math.round(height * spec.heightPct));
-      } else {
-        left = Math.min(width - 40, Math.round(labelRight + 6));
-        top = Math.max(0, Math.round(bb.y0) - spec.yPad);
-        cropW = Math.min(width - left, Math.max(40, Math.round(width * spec.widthPct)));
-        cropH = Math.min(height - top, Math.max(18, Math.round(bb.y1 - bb.y0) + spec.yPad * 2 + 6));
-      }
-
-      if (cropW < 36 || cropH < 14) continue;
-      const key = `${spec.re}:${left}:${top}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      try {
-        const scale = 3;
-        const cellBuf = await sharp(srcBuffer)
-          .extract({ left, top, width: cropW, height: cropH })
-          .resize({
-            width: cropW * scale,
-            height: cropH * scale,
-            kernel: sharp.kernel.lanczos3
-          })
-          .normalize()
-          .linear(1.45, -28)
-          .sharpen({ sigma: 1.0 })
-          .png()
-          .toBuffer();
-
-        try { await worker.setParameters({ tessedit_pageseg_mode: spec.below ? '6' : '7' }); } catch (e) { /* ignore */ }
-        const ret = await worker.recognize(cellBuf, {}, { blocks: true });
-        try { await worker.setParameters({ tessedit_pageseg_mode: '3' }); } catch (e) { /* ignore */ }
-
-        const cellLines = this.linesFromTesseractResult(ret, {
-          xOffset: left,
-          yOffset: top,
-          bandHeight: cropH,
-          pageHeight: height,
-          scale
-        });
-        for (const cl of cellLines) {
-          if (!cl.text || cl.text.trim().length < 2) continue;
-          // Prefix the original label so alias matching still finds this value
-          const labelHint = String(line.text || '').replace(/\s+/g, ' ').slice(0, 48);
-          cl.text = `${labelHint} ${cl.text}`.replace(/\s+/g, ' ').trim();
-          cl.confidence = Math.max(cl.confidence || 0, 82);
-          out.push(cl);
-        }
-      } catch (e) {
-        continue;
-      }
-    }
-
-    return out;
-  }
-
-  static async isolateBlueDarkInk(pngBuf) {
-    const { data, info } = await sharp(pngBuf).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-    const { width, height } = info;
-    const out = Buffer.alloc(width * height);
-    for (let i = 0; i < width * height; i++) {
-      const r = data[i * 3];
-      const g = data[i * 3 + 1];
-      const b = data[i * 3 + 2];
-      const luma = 0.3 * r + 0.59 * g + 0.11 * b;
-      const blueInk = b > r + 10 && b > g + 6 && luma < 210;
-      const dark = luma < 155 || Math.min(r, g) < 125;
-      out[i] = (blueInk || dark) ? 0 : 255;
-    }
-    return sharp(out, { raw: { width, height, channels: 1 } }).png().toBuffer();
-  }
-
-  /**
-   * Crop Early Years value cells using section-header anchors (not full-line bboxes).
-   * Full-page OCR mixes printed labels into handwriting; these crops recover Ref No / Name / DOB.
-   */
-  static async recognizeAnchoredHandwritingCells(worker, srcBuffer, width, height, lines) {
-    const layout = this.solveAccidentReportAnchors(lines || [], width, height);
-    if (!layout.hasDetectedAnchors) return [];
-
-    const yForm = layout.anchors.yForm || 0.22;
-    const yPerson = layout.anchors.yPerson || 0.28;
-    const yInc = layout.anchors.yInc || 0.445;
-    const x0 = layout.tblX0 || 0.05;
-
-    const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'- ";
-    const DATES = '0123456789/-. ';
-    const cells = [
-      { key: 'refNo', label: 'Ref No', y0: yForm + 0.010, y1: yForm + 0.038, x0: x0 + 0.05, x1: x0 + 0.25, wl: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-@®+ ', parse: 'refNo' },
-      { key: 'formDate', label: 'DATE', y0: yForm + 0.010, y1: yForm + 0.038, x0: x0 + 0.28, x1: x0 + 0.52, wl: DATES, parse: 'formDate' },
-      { key: 'projectName', label: 'PROJECT NAME', y0: yForm + 0.010, y1: yForm + 0.038, x0: x0 + 0.58, x1: x0 + 0.92, wl: LETTERS, parse: 'projectName' },
-      { key: 'bldgAddress', label: 'Building Address', y0: yPerson + 0.005, y1: yPerson + 0.032, x0: x0 + 0.16, x1: x0 + 0.85, wl: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789,'- ", parse: 'regAddress' },
-      { key: 'personName', label: 'Name of the person involved', y0: yPerson + 0.032, y1: yPerson + 0.058, x0: x0 + 0.20, x1: x0 + 0.64, wl: LETTERS, parse: 'personName' },
-      { key: 'dob', label: 'D.O.B', y0: yPerson + 0.032, y1: yPerson + 0.058, x0: x0 + 0.68, x1: x0 + 0.93, wl: DATES, parse: 'dob' },
-      { key: 'regAddress', label: 'Registered Address', y0: yPerson + 0.058, y1: yPerson + 0.084, x0: x0 + 0.16, x1: x0 + 0.64, wl: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789,'- ", parse: 'regAddress' },
-      { key: 'postcode', label: 'Postcode', y0: yPerson + 0.058, y1: yPerson + 0.084, x0: x0 + 0.68, x1: x0 + 0.93, wl: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ', parse: 'postcode' },
-      { key: 'contactNumber', label: 'Contact Number', y0: yPerson + 0.084, y1: yPerson + 0.112, x0: x0 + 0.14, x1: x0 + 0.48, wl: '0123456789 ', parse: 'contactNumber' },
-      { key: 'responsibleAdult', label: 'Responsible Adult', y0: yPerson + 0.084, y1: yPerson + 0.112, x0: x0 + 0.60, x1: x0 + 0.93, wl: LETTERS, parse: 'responsibleAdult' },
-      { key: 'session', label: 'SESSION', y0: yInc - 0.035, y1: yInc - 0.005, x0: x0 + 0.10, x1: x0 + 0.72, wl: LETTERS, parse: 'session' },
-      { key: 'incidentDate', label: 'Incident Date', y0: yInc + 0.012, y1: yInc + 0.048, x0: x0 + 0.04, x1: x0 + 0.30, wl: DATES, parse: 'incidentDate' },
-      { key: 'incidentTime', label: 'Incident Time', y0: yInc + 0.012, y1: yInc + 0.048, x0: x0 + 0.28, x1: x0 + 0.54, wl: '0123456789:ampmAMP. ', parse: 'incidentTime' },
-      { key: 'location', label: 'SPACE', y0: yInc + 0.012, y1: yInc + 0.048, x0: x0 + 0.52, x1: x0 + 0.92, wl: LETTERS, parse: 'location' }
-    ];
-
-    const parsers = {
-      refNo: DynamicExtractor.parseRefNo,
-      formDate: DynamicExtractor.parseDate,
-      projectName: (v) => {
-        const t = DynamicExtractor.tidyPhrase ? DynamicExtractor.tidyPhrase(v, 40) : String(v || '').trim();
-        if (!t || t.length < 3 || /^(TT|I|1|l)$/i.test(t)) return '';
-        if (/SureStart/i.test(t)) return 'SureStart';
-        if (/Life\s*One/i.test(t)) return 'Life One';
-        if (/S[- ]*START|S[- ]*qraer|S[- ]*c\s*tatt/i.test(t)) return 'S-Start';
-        if (/Riverdale/i.test(t)) return 'Riverdale';
-        return /SureStart|Life\s*One|Riverdale|[A-Za-z]{3,}/i.test(t) ? t : '';
-      },
-      personName: DynamicExtractor.parseName,
-      dob: DynamicExtractor.parseDate,
-      regAddress: DynamicExtractor.parseAddress,
-      postcode: DynamicExtractor.parseUkPostcode,
-      contactNumber: DynamicExtractor.parsePhoneNumber,
-      responsibleAdult: DynamicExtractor.parseName,
-      session: (v) => {
-        const t = String(v || '');
-        if (/after/i.test(t) && /session/i.test(t)) return 'After School Session';
-        if (/before/i.test(t) && /session/i.test(t)) return 'Before School Session';
-        return DynamicExtractor.tidyPhrase ? DynamicExtractor.tidyPhrase(t, 40) : t.trim();
-      },
-      incidentDate: DynamicExtractor.parseDate,
-      incidentTime: (v) => {
-        const s = String(v || '').replace(/4:70/g, '4:10');
-        const m = s.match(/\b([0-2]?\d[:.][0-5]\d\s*[AaPp][Mm])\b/) || s.match(/\b(\d{1,2}\s*[AaPp][Mm])\b/);
-        return m ? m[1].replace('.', ':').replace(/\s+/g, ' ') : '';
-      },
-      location: (v) => {
-        let t = String(v || '').replace(/SPACE\s*:?/i, '').replace(/\b(Maw|Man|Maine)\s+Hall\b/i, 'Main Hall').trim();
-        t = t.replace(/^[|\-\s]+/, '');
-        return t.length >= 3 ? t : '';
-      }
-    };
-
-    const out = [];
-    const existingText = (lines || []).map(l => l.text || '').join('\n');
-    for (const cell of cells) {
-      if (cell.key === 'refNo' && /AR-\d{4}-\d{4}|EY-TEST-\d+|CH-\d{4}/i.test(existingText)) continue;
-      if (cell.key === 'personName' && /\b(?:Emma Carter|Liam Parker|Mia Richardson|Ava Thompson)\b/i.test(existingText)) continue;
-
-      const left = Math.max(0, Math.round(width * Math.min(cell.x0, 0.95)));
-      const top = Math.max(0, Math.round(height * Math.min(cell.y0, 0.97)));
-      const cropW = Math.min(width - left, Math.max(24, Math.round(width * Math.max(0.04, cell.x1 - cell.x0))));
-      const cropH = Math.min(height - top, Math.max(16, Math.round(height * Math.max(0.018, cell.y1 - cell.y0))));
-      if (cropW < 36 || cropH < 14) continue;
-
-      let crop;
-      try {
-        crop = await sharp(srcBuffer)
-          .extract({ left, top, width: cropW, height: cropH })
-          .resize({
-            width: cropW * 3,
-            height: cropH * 3,
-            kernel: sharp.kernel.lanczos3
-          })
-          .png()
-          .toBuffer();
-      } catch (e) {
-        continue;
-      }
-
-      let buf;
-      try {
-        buf = await this.isolateBlueDarkInk(crop);
-      } catch (e) {
-        try {
-          buf = await sharp(crop).grayscale().normalize().linear(1.5, -30).png().toBuffer();
-        } catch (e2) {
-          continue;
-        }
-      }
-
-      const parse = parsers[cell.parse] || ((v) => String(v || '').trim());
-      let best = null;
-      try {
-        await worker.setParameters({
-          tessedit_pageseg_mode: '7',
-          tessedit_char_whitelist: cell.wl,
-          preserve_interword_spaces: '1'
-        });
-        const ret = await worker.recognize(buf);
-        const text = String(ret.data && ret.data.text ? ret.data.text : '').replace(/\s+/g, ' ').trim();
-        if (text) {
-          const parsed = parse(text) || '';
-          const conf = Number(ret.data && ret.data.confidence) || 0;
-          best = { text, parsed, conf };
-        }
-      } catch (e) {
-        /* skip */
-      }
-      try { await worker.setParameters({ tessedit_pageseg_mode: '3', tessedit_char_whitelist: '' }); } catch (e) { /* ignore */ }
-
-      const value = (best && (best.parsed || best.text) || '').trim();
-      if (!value || value.length < 2) continue;
-      if (cell.key === 'projectName' && /^(TT|I|1|l|-)$/i.test(value)) continue;
-
-      // Reject legal/incident definition words from header definition block
-      if (/\b(?:incident|accident|legally|encompasses|violence|committed|disrupts|unplanned|operations|potential|warning|discrete|psychological|fatality|fatalities|injuries|resulting)\b/i.test(value)) continue;
-
-      // Reject self-label echoes
-      if (/^(?:Responsible\s*Adult|Responsible[a-z]*|Name\s*of\s*the\s*person|Building\s*Address|Casualty\s*Name)$/i.test(value)) continue;
-
-      // Person name should never be a street name (ends in Way/Road/Street/Lane/Drive)
-      if (cell.key === 'personName' && /\b(?:Way|Road|Street|Drive|Lane|Avenue|Close)\b/i.test(value)) continue;
-
-      out.push({
-        text: `${cell.label} ${value}`.replace(/\s+/g, ' ').trim(),
-        bbox: { x0: left, y0: top, x1: left + cropW, y1: top + cropH },
-        confidence: Math.max(88, best.conf || 80),
-        words: [{ text: value, bbox: { x0: left, y0: top, x1: left + cropW, y1: top + cropH }, confidence: 88 }]
-      });
-    }
-
-    return out;
-  }
-
-  /**
-   * OCR full page + overlapping horizontal bands.
-   * Full-page Tesseract often skips dense middle handwriting on EY forms;
-   * banded passes recover Ref No / Name / Address / Incident rows.
+   * Fast, reliable local page OCR with Tesseract.
+   * Performs a clean full-page pass, plus an optional boosted contrast pass if needed.
    */
   static async recognizeWithBands(ocrBuffer, width, height, options = {}) {
     const worker = await this.getWorker();
     const all = [];
-    // Color source keeps blue ballpoint ticks; grayscale full-page buffer loses them
     const boostSrc = options.colorBuffer || ocrBuffer;
+
     try {
-      await worker.setParameters({ preserve_interword_spaces: '1' });
+      await worker.setParameters({
+        preserve_interword_spaces: '1',
+        tessedit_pageseg_mode: '3'
+      });
 
-      // 1) Full page
+      // Pass 1: Full page standard OCR
       const full = await worker.recognize(ocrBuffer, {}, { blocks: true });
-      all.push(...this.linesFromTesseractResult(full));
+      const fullLines = this.linesFromTesseractResult(full);
+      all.push(...fullLines);
 
-      const fullText = all.map(l => l.text).join('\n');
-      const looksEy = /Accident\s*&\s*Incident|ABOUT THE PERSON|ABOUT THE INCIDENT|ToyBox|SureStart|RIDDOR/i.test(fullText);
-      const missingMiddle = !/ABOUT THE PERSON|Name of the person|Registered Address|Responsible Adult/i.test(fullText);
-      const missingChecks = !/TYPE\s+ACCIDENT|SEVERITY\s+RIDDOR|MINOR|SLIP\s*\/?\s*TRIP|RETURN TO ACTIVIT/i.test(fullText);
-
-      // 2) Fast targeted bands for handwriting and tick marks
-      const bands = [];
-      if (looksEy || missingChecks || missingMiddle) {
-        bands.push(
-          { y0: 0.14, y1: 0.44, boost: true, scale: 2 },       // Ref / Date / Name / DOB / Address / Postcode / Contact
-          { y0: 0.40, y1: 0.68, boost: true, scale: 2 },       // Incident / Type / Severity / RIDDOR / Cause
-          { y0: 0.66, y1: 0.98, boost: true, scale: 2 }        // Injury / Outcome / Narrative / Sign-off
-        );
-      }
-
-      for (const band of bands) {
-        const top = Math.max(0, Math.round(height * band.y0));
-        const bottom = Math.min(height, Math.round(height * band.y1));
-        const bandH = Math.max(40, bottom - top);
-        const src = band.boost ? boostSrc : ocrBuffer;
-        let bandBuf;
+      // Pass 2: If sparse or low confidence, run a single adaptive contrast pass
+      const needsBoost = fullLines.length < 8 || fullLines.some(l => (l.confidence || 0) < 55);
+      if (needsBoost) {
         try {
-          let pipe = sharp(src)
-            .extract({ left: 0, top, width: Math.max(1, width), height: bandH });
-          if (band.boost) {
-            pipe = pipe.normalize().linear(1.4, -30).sharpen({ sigma: 1.1 });
-          }
-          if (band.scale && band.scale > 1) {
-            pipe = pipe.resize({
-              width: Math.round(width * band.scale),
-              height: Math.round(bandH * band.scale),
-              kernel: sharp.kernel.lanczos3
-            });
-          }
-          bandBuf = await pipe.png().toBuffer();
-        } catch (e) {
-          continue;
-        }
-        if (band.boost) {
-          try { await worker.setParameters({ tessedit_pageseg_mode: '6' }); } catch (e) { /* ignore */ }
-        }
-        const ret = await worker.recognize(bandBuf, {}, { blocks: true });
-        if (band.boost) {
-          try { await worker.setParameters({ tessedit_pageseg_mode: '3' }); } catch (e) { /* ignore */ }
-        }
-        all.push(...this.linesFromTesseractResult(ret, {
-          yOffset: top,
-          bandHeight: bandH,
-          pageHeight: height,
-          scale: band.scale || 1
-        }));
-      }
+          const boostBuf = await sharp(boostSrc)
+            .normalize()
+            .linear(1.3, -20)
+            .sharpen({ sigma: 1.0 })
+            .png()
+            .toBuffer();
 
-      // 3) Targeted row-strip recovery for table rows (Ref No, Dates, Project, Names, Addresses, Postcode)
-      if (looksEy || /Name of the person|Ref No|Registered Address|ABOUT THE PERSON/i.test(fullText)) {
-        try {
-          const layout = this.solveAccidentReportAnchors(all, width, height);
-          const yF = layout.anchors.yForm || 0.2565;
-          const rowStrips = [
-            { y0: yF + 0.012, y1: yF + 0.038, tag: 'row1' }, // Ref No / Date / Project Name
-            { y0: yF + 0.038, y1: yF + 0.064, tag: 'row2' }, // Building Address
-            { y0: yF + 0.064, y1: yF + 0.090, tag: 'row3' }, // Name of the person / DOB
-            { y0: yF + 0.090, y1: yF + 0.117, tag: 'row4' }, // Registered Address / Postcode
-            { y0: yF + 0.117, y1: yF + 0.145, tag: 'row5' }, // Contact Number / Responsible Adult
-            { y0: yF + 0.150, y1: yF + 0.180, tag: 'row6' }, // Session
-            { y0: yF + 0.190, y1: yF + 0.228, tag: 'row7' }, // Incident Date / Time / Space
-          ];
-          for (const strip of rowStrips) {
-            const top = Math.max(0, Math.round(height * strip.y0));
-            const bottom = Math.min(height, Math.round(height * strip.y1));
-            const h = bottom - top;
-            if (h < 15) continue;
-            const left = Math.max(0, Math.round(width * 0.04));
-            const w = Math.min(width - left, Math.round(width * 0.92));
-            try {
-              const buf = await sharp(boostSrc)
-                .extract({ left, top, width: w, height: h })
-                .resize({ width: w * 2, height: h * 2, kernel: sharp.kernel.lanczos3 })
-                .grayscale()
-                .normalize()
-                .sharpen()
-                .png()
-                .toBuffer();
-              try { await worker.setParameters({ tessedit_pageseg_mode: '6' }); } catch (e) { /* ignore */ }
-              const ret = await worker.recognize(buf, {}, { blocks: true });
-              try { await worker.setParameters({ tessedit_pageseg_mode: '3' }); } catch (e) { /* ignore */ }
-              all.push(...this.linesFromTesseractResult(ret, {
-                yOffset: top,
-                bandHeight: h,
-                pageHeight: height,
-                scale: 2
-              }));
-            } catch (e) {
-              /* ignore individual row strip error */
-            }
-          }
-        } catch (e) {
-          console.warn('Row strip OCR warning:', e.message);
+          await worker.setParameters({ tessedit_pageseg_mode: '6' });
+          const boosted = await worker.recognize(boostBuf, {}, { blocks: true });
+          all.push(...this.linesFromTesseractResult(boosted));
+        } catch (bErr) {
+          // ignore boost failure
         }
       }
     } finally {
       try { await worker.terminate(); } catch (e) { /* ignore */ }
     }
 
-    // Dedupe near-identical lines (same text + close Y).
-    // Prefer lines that still carry checkbox tick tokens (val/[v/Vv) from contrast bands.
-    const hasTickToken = (t) => /\bval\b|\bvif\b|\bvil\b|\bIva?\b|\bVv\b|\bVa\b|\bVi\b|\[v|V\/]|[Vv]4\b|(?:^|\s)V[avil]?(?:\s|$)/i.test(String(t || ''));
-    const softKey = (t) => String(t || '')
-      .replace(/\bval\b|\bvif\b|\bvil\b|\bIva?\b|\bVv\b|\bVa\b|\bVi\b|\[v\d?|[Vv]\/?\]|[Vv]4/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
+    // Deduplicate near-identical lines
     const deduped = [];
     for (const line of all) {
-      const key = String(line.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      if (!key || key.length < 2) continue;
+      const text = String(line.text || '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length < 2) continue;
       const y = line.bbox ? line.bbox.y0 : 0;
-      const sk = softKey(line.text);
       const dup = deduped.find(d => {
         const dy = Math.abs((d.bbox?.y0 || 0) - y);
-        if (dy >= Math.max(22, height * 0.02)) return false;
-        const dk = String(d.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        if (dk === key) return true;
-        // Same checkbox row with/without tick glyphs (boost band vs full page)
-        const dsk = softKey(d.text);
-        return dsk.length > 12 && sk.length > 12 && (dsk === sk || dsk.includes(sk.slice(0, 24)) || sk.includes(dsk.slice(0, 24)));
+        if (dy >= Math.max(18, height * 0.018)) return false;
+        const dt = String(d.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const lt = text.toLowerCase();
+        return dt === lt || (dt.length > 8 && lt.length > 8 && (dt.includes(lt) || lt.includes(dt)));
       });
+
       if (!dup) {
         deduped.push(line);
-        continue;
+      } else if ((line.confidence || 0) > (dup.confidence || 0) + 5) {
+        Object.assign(dup, line);
       }
-      const preferNew =
-        (hasTickToken(line.text) && !hasTickToken(dup.text)) ||
-        (/\d/.test(line.text || '') && !/\d/.test(dup.text || '')) ||
-        ((line.text || '').length > (dup.text || '').length + 5) ||
-        ((hasTickToken(line.text) === hasTickToken(dup.text)) && (line.confidence || 0) > (dup.confidence || 0) + 4) ||
-        (/\b[A-Za-z]{3,}\s+[A-Za-z]{3,}\b/.test(line.text || '') && !/\b[A-Za-z]{3,}\s+[A-Za-z]{3,}\b/.test(dup.text || ''));
-      if (preferNew) Object.assign(dup, line);
     }
 
     deduped.sort((a, b) => (a.bbox?.y0 || 0) - (b.bbox?.y0 || 0));

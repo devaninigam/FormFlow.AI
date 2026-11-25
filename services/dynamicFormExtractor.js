@@ -353,16 +353,15 @@ function parseDate(raw) {
     if (parseInt(d, 10) <= 31 && parseInt(mth, 10) <= 12) return `${d}.${mth}.${y}`;
     return all;
   });
-  // OCR date repairs for garbled handwritten dates
+  // OCR date repairs for common character confusions
   s = s.replace(/\[\s*ATE\b/i, 'DATE');
-  s = s.replace(/\b[CJ][GGo6e0]{1,3}[-./:e]/i, '06-');
-  s = s.replace(/\bJ?ec[-./:]/i, '06-');
-  s = s.replace(/\b[cC]([0-9])[-./:]/i, '0$1-');
-  // OCR month 01 as 0l / ol / O1 — never rewrite a real month 11
+  // OCR month 01 as 0l / ol / O1
   s = s.replace(/[-./:](?:[oO][lI1]|0[lI])[-./:]/g, '-01-');
-  s = s.replace(/\b23[-./:]9[-./:]26\b/, '23-01-2026');
-  s = s.replace(/\b(?:I|1)?\s*(?:eel|Ieee|16)\s*[/\\\-\s]*(?:XA|06|[oO]6|X49|1%|19)\b/i, '12-06-2019');
-  // Match standard UK / ISO numeric dates: DD-MM-YYYY, DD/MM/YY, DD.MM.YYYY, DD.MM.YY, DD MM YY
+  // Match standard numeric dates: DD-MM-YYYY, DD/MM/YY, YYYY-MM-DD, etc.
+  const isoMatch = s.match(/\b(19\d\d|20\d\d)[-/.](0[1-9]|1[0-2])[-/.](0[1-9]|[12]\d|3[01])\b/);
+  if (isoMatch) {
+    return `${isoMatch[3]}-${isoMatch[2]}-${isoMatch[1]}`;
+  }
   const m = s.match(/\b(\d{1,2})\s*[-./:]+\s*(\d{1,2})\s*[-./:]+\s*(\d{2,4})\b/);
   if (m) {
     let [, d, mth, y] = m;
@@ -386,21 +385,8 @@ function parseUkPostcode(raw) {
   // Strip trailing label triggers glued on same line
   s = s.replace(/\s+(?:Contact|Responsible|Adult|STAFF|Tel|Phone|Mobile|DOB)\b.*$/i, '').trim();
 
-  // Repair common OCR noise in UK postcodes:
-  s = s.replace(/\b(?:L7T|B7|Isc|1sc|8T|87)\s*1[27cC]\s*(?:ca|[©oO0]\s*[A-Za-z]{1,2}|©\s*\([A-Za-z]|6[A-Z]{2})\b/i, 'BT17 6TG');
-  s = s.replace(/\b(?:BT|8T|B7)\s*1[27]\s*([0-9A-Z]{3})\b/i, 'BT17 $1');
-  s = s.replace(/[£5E]T\s*1\)?\s*BT/i, 'BT1 1BT');
-  s = s.replace(/[£5]11\s*RT/i, 'BT1 1BT');
-  s = s.replace(/BT11\s*BT/i, 'BT1 1BT');
-  s = s.replace(/\bB[71]\s*([0-9][A-Z]{2})\b/i, 'BT $1');
-  s = s.replace(/\bB7(\d)\s*([A-Z\d]{3})\b/i, 'BT$1 $2');
-  s = s.replace(/\bBTS\s*([0-9][A-Z]{2})\b/i, 'BT5 $1');
-  s = s.replace(/\bBT5\s*6QT\b/i, 'BT5 6QT');
-  s = s.replace(/\bCV4\s*F\.?N\b/i, 'CV4 7LN');
-  s = s.replace(/\bNG[E£8S]\s*([0-9A-Z]{3})\b/i, 'NG8 $1');
-  s = s.replace(/\b([A-Z]{1,2})[E£SB](\s*[0-9A-Z]{3})\b/i, '$18 $2');
+  // Character normalization: repair common OCR confusions in postcodes
   s = s.replace(/\b([A-Z]{1,2})\s+(\d[A-Z\d]?)\s+(\d[A-Z]{2})\b/i, '$1$2 $3');
-  s = s.replace(/\bNG\s*8\s*3[.\s]*$/i, 'NG8 3LQ');
 
   // UK Postcode: e.g. BT9 6RQ, SW1A 1AA, LS9 7AB, EC2A 4NE, M1 1AE
   const m = s.match(/\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/i);
@@ -414,19 +400,19 @@ function parseUkPostcode(raw) {
     return m[1].toUpperCase();
   }
 
+  // General 5-digit or 5+4 US ZIP code: e.g. 97477, 10001-1234
+  const zip = s.match(/\b(\d{5}(?:-\d{4})?)\b/);
+  if (zip) return zip[1];
+
   // Inward digit often OCR'd as a letter: LS9 FAB → LS9 7AB (F↔7, I↔1, O↔0, S↔5, B↔8, Z↔2)
   const broken = s.match(/\b([A-Z]{1,2}\d[A-Z\d]?)\s*([A-Z]{3})\b/i);
   if (broken) {
     const map = { F: '7', I: '1', L: '1', O: '0', S: '5', B: '8', Z: '2' };
-    const inwardDigit = map[broken[2][0].toUpperCase()] || '';
-    if (inwardDigit) {
-      return `${broken[1].toUpperCase()} ${inwardDigit}${broken[2].slice(1).toUpperCase()}`;
+    const fixedInward = (map[broken[2][0].toUpperCase()] || broken[2][0]) + broken[2].slice(1);
+    if (/\d/.test(fixedInward[0])) {
+      return `${broken[1].toUpperCase()} ${fixedInward.toUpperCase()}`;
     }
   }
-
-  // US ZIP code (e.g. 90210, 94107-1234)
-  const zip = s.match(/\b(\d{5}(?:-\d{4})?)\b/);
-  if (zip) return zip[1];
 
   // Canadian postal code (e.g. K1A 0B1)
   const ca = s.match(/\b([A-Z]\d[A-Z]\s*\d[A-Z]\d)\b/i);
@@ -499,15 +485,7 @@ function parseName(raw) {
   s = s.replace(/\b7\b/g, 'T');
   // Drop 2–4 letter OCR crumbs that are not real name particles
   s = s.replace(/\b(?:OI|CPS|SIPS|T|HZ|VV|WV|IV)\b/gi, ' ').replace(/\s+/g, ' ').trim();
-  // Common OCR name repairs
   s = s.replace(/\s+(?:Ieee|Iee|eel|X\d+|D\.?O\.?B).*$/i, '');
-  s = s.replace(/\bT[aA]mES\s+kicRoY\b/i, 'James Gilroy');
-  s = s.replace(/\bTAmES\b/i, 'James');
-  s = s.replace(/\bkicRoY\b/i, 'Gilroy');
-  s = s.replace(/\bJidia\b/i, 'Julia').replace(/\bLiam\s+Os\b/i, 'Liam');
-  s = s.replace(/\bDancel\b/i, 'Daniel');
-  s = s.replace(/\b[JTI7]hompson\b/i, 'Thompson');
-  s = s.replace(/\bThonpson\b/i, 'Thompson');
 
   // Strip common section noise and self-label echoes
   if (/^(?:ABOUT|SECTION|PART|ACCIDENT|INCIDENT|REPORT|FORM|REGISTERED|BUILDING|RESPONSIBLE|ADULT|ADUTT)/i.test(s)) {
@@ -649,12 +627,11 @@ function isPlausibleLocation(value) {
 
 function isValidOptionLabel(label) {
   const t = tidyPhrase(label, 40);
-  if (!t || t.length < 2 || t.length > 36) return false;
+  if (!t || t.length < 2 || t.length > 40) return false;
   if (/ABOUT THIS FORM|COMPLETION|PLEASE|NARRATIVE|REGISTERED|CONTACT NUMBER|REF NO|EY-|TEST/i.test(t)) return false;
-  if (/^\d/.test(t)) return false;
-  if (/\d{3,}/.test(t)) return false; // refs / phone fragments are not checkbox labels
-  // Strict: only known option vocabulary (Accident, Morning, First Aid, etc.)
-  return OPTION_LABEL_HINT.test(t) || OPTION_LABEL_HINT.test(t.split(/\s+/).slice(0, 3).join(' '));
+  if (/^\d+$/.test(t)) return false;
+  if (/\d{4,}/.test(t)) return false; // refs / phone fragments are not checkbox labels
+  return OPTION_LABEL_HINT.test(t) || OPTION_LABEL_HINT.test(t.split(/\s+/).slice(0, 3).join(' ')) || /^[A-Za-z][A-Za-z0-9\s/()-]{1,35}$/.test(t);
 }
 
 function parseAddress(raw) {
@@ -662,7 +639,7 @@ function parseAddress(raw) {
   let s = tidyPhrase(raw, 80);
   s = s.replace(/^(?:Registered Address|Address|Building Address|fegistered|registered\s*aqaress|registered\s*adutess|fpesmereassness)[:|\s-]*/i, '');
   // Ignore section header noise lines
-  if (/^(?:ABOUT|SECTION|PART|ACCIDENT|INCIDENT|REPORT|FORM|REGISTERED|BUILDING|ARNT\s*TUL)/i.test(s) && !/Wildflower|Avenue|Road|Street|Drive|Way|Lane|Anytown/i.test(s)) {
+  if (/^(?:ABOUT|SECTION|PART|ACCIDENT|INCIDENT|REPORT|FORM|REGISTERED|BUILDING|ARNT\s*TUL)/i.test(s) && !/Avenue|Road|Street|Drive|Way|Lane/i.test(s)) {
     return '';
   }
   // Strip trailing postcodes, dates or labels
@@ -670,24 +647,16 @@ function parseAddress(raw) {
   s = s.replace(/\b\d{1,2}[-./]\d{1,2}[-./]\d{2,4}\b/g, ''); // strip embedded date
   s = s.replace(/[|~_#\[\]{}]+/g, ' ').trim();
 
-  // Address repairs for known handwritten forms
-  s = s.replace(/.*?\b(?:[6b2gG][Cc6]|[2b]6)\s*[_/\\|\s]*[L/I1l]*\s*(?:[WI1]?[IL1][LO0][A-Za-z]?|WILD)\s*(?:Low|Crow|FLOW|flow|CLOW)[A-Za-z\s]*(?:AY|AN|WAY|Way)\b/i, '26 Wildflower Way');
-  s = s.replace(/\b(?:ANT|Any)\s*TOW[A-Za-z]*\s*(?:>|pm|LL|~+)?\s*(?:No\.?|Ng\.?)\s*(\d{1,2})?\b/i, 'Anytown, No. 7');
-  s = s.replace(/\bANT\s*TOW\b/i, 'Anytown');
-  if (/\bAnytown\b/i.test(s)) return 'Anytown, No. 7';
-  if (/\b26\s*Wildflower\s*Way\b/i.test(s)) return '26 Wildflower Way';
-
   // Match street pattern: number + street name + type (Avenue, Street, Road, etc.)
-  const m = s.match(/\b(\d{1,4}\s+[A-Za-z][A-Za-z0-9\s,'-]{1,40}(?:Avenue|Ave|Aavwe|Acue|Ac\s*ec|Street|St|Road|Rd|Close|Drive|Dr|Way|Lane|Mews|Court|Place|Hill|Walk|Gardens|Grove|Crescent|Cres|Park|Terrace|Square))\b/i);
+  const m = s.match(/\b(\d{1,4}\s+[A-Za-z][A-Za-z0-9\s,'-]{1,40}(?:Avenue|Ave|Street|St|Road|Rd|Close|Drive|Dr|Way|Lane|Mews|Court|Place|Hill|Walk|Gardens|Grove|Crescent|Cres|Park|Terrace|Square))\b/i);
   if (m) {
-    let res = m[1].trim().replace(/\s+(?:Aavwe|Acue|Ac\s*ec)\b/i, ' Avenue');
+    let res = m[1].trim();
     // Drop leading OCR junk digits stuck before house number (e.g. "2 14 Meadow Close")
     res = res.replace(/^\d\s+(?=\d+\s)/, '');
-    res = res.replace(/\b[MN][aef]{0,2}ple\b/i, 'Maple');
     res = res.replace(/\bCres\.?\b/i, 'Crescent');
     // Append city if present right after
     const city = s.slice(s.indexOf(m[1]) + m[1].length).match(/^\s*,?\s*([A-Za-z]{3,20})\b/);
-    if (city && !/BT\d|Postcode|Responsible|Staff|cent|cres|road|street|lane|close/i.test(city[1])) {
+    if (city && !/Postcode|Responsible|Staff|cent|cres|road|street|lane|close/i.test(city[1])) {
       res = `${res}, ${city[1]}`;
     }
     return tidyPhrase(res, 60);
@@ -958,7 +927,7 @@ function detectCheckboxSquares(pixels, width, height) {
 }
 
 const OPTION_LABEL_HINT =
-  /^(Morning|Moning|Moming|Afternoon|Aftemoon|All\s*Day|AllDay|Accident|Incident|Near\s*Miss|Yes|No|Cut|Bruise|Bump|Sprain|Other|Returned to Activity|Collected by Parent\/?Carer|Collected by Parent|Went Home|EY Staff|Evstff|Non EY Staff|Visitor|Vistor|Parent|Daycare|ToyBox|SureStart|RIDDOR|Moderate|Minor|Dangerous Occurrence|Reportable Disease|NIAS|First Aid|First Aid Applied|Return to Activities|Hospital Admittance|Emotional Support|Slip\s*\/?\s*Trip\s*\/?\s*Fall|Manual Handling|Choking|Venue|Equipment|Unknown|COSHH|Traffic|Abrasion|Fracture)$/i;
+  /^(Morning|Moning|Moming|Afternoon|Aftemoon|All\s*Day|AllDay|Accident|Incident|Near\s*Miss|Yes|No|Cut|Bruise|Bump|Sprain|Other|Returned to Activity|Collected by Parent\/?Carer|Collected by Parent|Went Home|EY Staff|Evstff|Non EY Staff|Visitor|Vistor|Parent|Daycare|ToyBox|SureStart|RIDDOR|Moderate|Minor|Dangerous Occurrence|Reportable Disease|NIAS|First Aid|First Aid Applied|Return to Activities|Hospital Admittance|Emotional Support|Slip\s*\/?\s*Trip\s*\/?\s*Fall|Manual Handling|Choking|Venue|Equipment|Unknown|COSHH|Traffic|Abrasion|Fracture|Pass|Fail|N\/?A|Male|Female|Single|Married|Divorced|Widowed|Active|Inactive|Approved|Rejected|Pending|Complete|Incomplete|Satisfactory|Unsatisfactory|Action Required|Safe|Unsafe|Good|Fair|Poor|Critical|High|Medium|Low|Urgent|Routine|Inpatient|Outpatient|Cash|Card|Credit|Debit|Cheque|Check|Permanent|Temporary|Full-Time|Part-Time|Normal|Abnormal|True|False)$/i;
 
 /**
  * Detect checkboxes by finding option-like OCR labels, then probing CV to the LEFT of each label.
@@ -1013,7 +982,8 @@ function detectCheckboxesNearLabels(pixels, width, height, lines) {
         extras.push(t);
         const joined = extras.join(' ');
         const candidate = tidyPhrase(joined, 40);
-        const isOption = OPTION_LABEL_HINT.test(extras[0]) || OPTION_LABEL_HINT.test(candidate);
+        const isOption = OPTION_LABEL_HINT.test(extras[0]) || OPTION_LABEL_HINT.test(candidate) ||
+          (candidate.length >= 2 && candidate.length <= 35 && !/:$/.test(candidate) && (String(line.text || '').includes('[') || String(line.text || '').includes('□')));
         if (!isOption) continue;
 
         label = candidate;
@@ -1023,12 +993,11 @@ function detectCheckboxesNearLabels(pixels, width, height, lines) {
         const lineText = String(line.text || '');
         const opt = escapeRegExp(extras[0]);
         // Marks may sit immediately before OR after the option (OCR often emits "ACCIDENT |Z")
-        // Only treat Z/7 as a tick for Accident/Incident/Near Miss rows — elsewhere it is OCR noise.
         const zOk = /^(accident|incident|near\s*miss)$/i.test(extras.join(' ')) || /^(accident|incident)$/i.test(extras[0]);
         const markCls = zOk ? 'xX✓✔vVZ78&§' : 'xX✓✔vV&§';
-        // A mark after an option is either bracketed [x], (v), or a standalone letter/slash/symbol at end of token/word — NOT a slash before words (e.g. FRACTURE / BROKEN)
+        // A mark after an option is either bracketed [x], (v), or a standalone letter/slash/symbol at end of token/word — NOT a slash before words
         const markAfter = new RegExp(`${opt}\\s{0,28}(?:\\[\\s*[${markCls}/\\\\*+#§27Z&]{1,3}\\s*\\]|\\(\\s*[${markCls}/\\\\*+§27Z&]\\s*\\)|[\\|\\[\\(]\\s*[${markCls}/\\\\]|(?:^|\\s)[${markCls}](?:\\s|$)|(?:^|\\s)[/\\\\](?:\\s|$)|(?:^|\\s)[§#&][0-9A-Za-z/\\*]?(?:\\s|$)|(?:^|\\s)(?:vd|od|val|vif|vil|Iva?|VJ|Vv|wv|vv|ww|cs)(?:\\s|$)|[7Z52#§\\/&][\\]\\)])(?![A-Za-z0-9])`, 'i');
-        // A mark before an option must be bracketed or at start of line — NOT an earlier option's mark (e.g. "ToyBox [v] SureStart []")
+        // A mark before an option must be bracketed or at start of line
         const markBefore = new RegExp(`(?:\\[\\s*[${markCls}/\\\\*+#]{1,3}\\s*\\]|\\(\\s*[${markCls}/\\\\*+]\\s*\\)|^[\\|\\[\\(]?\\s*[${markCls}/\\\\])\\s{0,3}${opt}`, 'i');
         const isEmptyOcr = /\[\s*\]|\(\s*\)|\[\s*[_ \-.]\s*\]|[□☐○◯]|\[\s*[JIl1oO0mm=]{1,4}\s*\]|\(\s*[JIl1oO0mm=]{1,4}\s*\)/i.test(prevText) || /\[\s*\]|\(\s*\)|\[\s*[_ \-.]\s*\]|[□☐○◯]/i.test(lineText);
         const checkedFromOcr = !isEmptyOcr && (
@@ -1038,8 +1007,8 @@ function detectCheckboxesNearLabels(pixels, width, height, lines) {
           markBefore.test(lineText)
         );
 
-        const inOptionsBand = /Session|Type of Incident|First Aid|TYPE OF INJURY|OUTCOME|Morning|Afternoon|Accident|Near Miss|STAFF|CHILD|CAUSE|RIDDOR/i.test(lineText);
-        if (!inOptionsBand && !checkedFromOcr && !OPTION_LABEL_HINT.test(label)) break;
+        const inOptionsBand = /Session|Type of Incident|First Aid|TYPE OF INJURY|OUTCOME|Morning|Afternoon|Accident|Near Miss|STAFF|CHILD|CAUSE|RIDDOR|Status|Result|Inspection|Condition|Checklist|Gender|Sex|Marital|Option/i.test(lineText);
+        if (!inOptionsBand && !checkedFromOcr && !OPTION_LABEL_HINT.test(label) && !isOption) break;
 
         // Probe the checkbox belonging to this option label.
         // In form tables, each cell has label followed by its checkbox (after the label).
@@ -1161,7 +1130,7 @@ function associateCheckboxesWithLabels(checkboxes, lines, width, height) {
         best = w;
       }
     }
-    if (!best || !OPTION_LABEL_HINT.test(best.text)) return null;
+    if (!best || (!OPTION_LABEL_HINT.test(best.text) && !isValidOptionLabel(best.text))) return null;
     return {
       ...box,
       label: best.text,
@@ -1597,6 +1566,79 @@ function extractDynamicFormFields(lines, options = {}) {
     }
   }
 
+  // 3c) Generic Key-Value extractor for arbitrary documents (Invoices, Medical, Inspection, Forms)
+  for (const line of lines || []) {
+    const text = String(line.text || '').trim();
+    if (!text || text.length < 3) continue;
+
+    // Check for standard colon, equals or hyphen key-value separator: "Patient Name: John Smith"
+    const kvMatch = text.match(/^([A-Za-z0-9][A-Za-z0-9\s/&()._-]{1,40})\s*[:=]\s*(.+)$/);
+    if (kvMatch) {
+      const rawLabel = tidyPhrase(kvMatch[1], 40);
+      const rawVal = tidyPhrase(kvMatch[2], 120);
+      const normKey = normalizeLabelKey(rawLabel);
+
+      if (rawLabel && rawVal && normKey && !claimedLabels.has(normKey) && !looksLikeOcrJunk(rawVal)) {
+        if (!/^(page|sheet|total\s*pages|copyright|all\s*rights|http|www|section|chapter)$/i.test(normKey)) {
+          let fieldType = 'text';
+          if (/date|dob|birth|due|issued/i.test(rawLabel)) {
+            const d = parseDate(rawVal);
+            if (d) fieldType = 'date';
+          } else if (/total|amount|price|subtotal|balance|cost|fee|rate|tax|vat|qty|quantity/i.test(rawLabel)) {
+            fieldType = 'number';
+          } else if (/phone|mobile|tel|fax/i.test(rawLabel)) {
+            fieldType = 'number';
+          } else if (/address/i.test(rawLabel)) {
+            fieldType = 'address';
+          } else if (/email/i.test(rawLabel)) {
+            fieldType = 'text';
+          }
+
+          const lineConf = line.confidence ? Math.max(0.35, Math.min(0.95, line.confidence / 100)) : 0.75;
+          pushField({
+            label: rawLabel,
+            value: rawVal,
+            originalOcrValue: rawVal,
+            type: fieldType,
+            bounds: boundsFromLine(line, width, height, rawVal),
+            confidence: lineConf,
+            isUnreadable: lineConf < 0.45,
+            needsVerification: lineConf < 0.85,
+            source: 'generic_kv_pair',
+            section: 'Document Fields'
+          });
+        }
+      }
+    }
+  }
+
+  // 3d) Simple tabular structure detection from pipe or tab-delimited lines
+  const detectedTables = [];
+  const tableCandidateRows = [];
+  for (const line of lines || []) {
+    const text = String(line.text || '').trim();
+    if (text.includes('|') && text.split('|').filter(c => c.trim().length > 0).length >= 2) {
+      const cells = text.split('|').map(c => c.trim()).filter(c => c.length > 0);
+      if (cells.length >= 2) {
+        tableCandidateRows.push({
+          cells,
+          y: line.bbox ? line.bbox.y0 / height : 0,
+          line
+        });
+      }
+    }
+  }
+  if (tableCandidateRows.length >= 2) {
+    const headers = tableCandidateRows[0].cells;
+    const rows = tableCandidateRows.slice(1).map(r => r.cells);
+    detectedTables.push({
+      page: pageNum,
+      headers,
+      rows,
+      confidence: 0.82
+    });
+  }
+
   // 4) CV checkbox squares associated with nearby labels
   const cvFields = [];
   for (const box of cvCheckboxes || []) {
@@ -1658,7 +1700,7 @@ function extractDynamicFormFields(lines, options = {}) {
     f.id = `field_${startCounter + i}`;
   });
 
-  return { fields, tables: [], nextCounter: startCounter + fields.length };
+  return { fields, tables: detectedTables, nextCounter: startCounter + fields.length };
 }
 
 // ============================================================================
@@ -2047,47 +2089,56 @@ function extractEarlyYearsByAliases(lines, options = {}) {
       }
     }
 
-    // Building Address fallback for OCR garbles
+    // Building Address fallback: search OCR lines for address in the header/building band
     if (target.key === 'bldgAddress' && !parsed) {
       for (const line of lines || []) {
         const t = String(line.text || '');
-        if (/Wildflower|WILO|ILO\s*Low|CLOW\s*Ea|Crow\s*Ea/i.test(t)) {
-          parsed = '26 Wildflower Way';
-          raw = parsed;
-          break;
+        const y = line.bbox && height ? line.bbox.y0 / height : 0.2;
+        if (y < 0.1 || y > 0.35) continue;
+        if (/address|bldg|building|way|road|street|drive|lane/i.test(t)) {
+          const addr = parseAddress(t);
+          if (addr) {
+            parsed = addr;
+            raw = addr;
+            break;
+          }
         }
       }
     }
 
-    // Registered Address fallback for OCR garbles
+    // Registered Address fallback: search OCR lines in the person address band
     if (target.key === 'regAddress' && !parsed) {
       for (const line of lines || []) {
         const t = String(line.text || '');
         const y = line.bbox && height ? line.bbox.y0 / height : 0.35;
         if (y < 0.28 || y > 0.44) continue;
-        if (/ANY\s*TOW|Anytown/i.test(t)) {
-          parsed = 'Anytown, No. 7';
-          raw = parsed;
-          break;
+        if (/address|reg|street|road|way|lane|avenue|town/i.test(t)) {
+          const addr = parseAddress(t);
+          if (addr) {
+            parsed = addr;
+            raw = addr;
+            break;
+          }
         }
       }
     }
 
-    // DOB fallback for handwritten date crumbs
+    // DOB fallback: search OCR lines in the person date band
     if (target.key === 'dob' && !parsed) {
       for (const line of lines || []) {
         const t = String(line.text || '');
         const y = line.bbox && height ? line.bbox.y0 / height : 0.3;
         if (y < 0.25 || y > 0.42) continue;
-        if (/12[-./\s]*06[-./\s]*(?:19|2019)|eel\s*X49|16\s*\/\s*XA|Ieee\s*X49/i.test(t)) {
-          parsed = '12-06-2019';
-          raw = parsed;
+        const d = parseDate(t);
+        if (d && (!values.formDate || d.slice(0, 5) !== String(values.formDate).slice(0, 5))) {
+          parsed = d;
+          raw = d;
           break;
         }
       }
     }
 
-    // Improve weak/bad names like "Pa Roll" or "Liam Os" when the document has a clear name
+    // Person Name fallback: search lines for clear "Name: <Proper Name>"
     if (target.key === 'personName') {
       if (parsed && /\b(?:Way|Road|Street|Drive|Lane|Avenue|Close)\b/i.test(parsed)) {
         if (!values.bldgAddress) values.bldgAddress = parsed;
@@ -2096,42 +2147,11 @@ function extractEarlyYearsByAliases(lines, options = {}) {
       if (!parsed) {
         for (const line of lines || []) {
           const t = String(line.text || '');
-          if (/T[Aa]m[A-Za-z]*\s+kic[A-Za-z]*|James\s+Gilroy|James\s+Gilbert/i.test(t)) {
-            parsed = 'James Gilroy';
-            raw = parsed;
-            break;
-          }
-        }
-      }
-      const isBadName = !parsed || /^(Pa\s*Roll|Payroll|Tanne\s*Carter)$/i.test(parsed) || /^[A-Za-z]{2,12}\s+[A-Za-z]{1,3}$/.test(parsed) || /^(Liam|Lisa)\s+Os$/i.test(parsed);
-      if (isBadName || !/\b(Emma|Liam|Lisa|Ava|Daniel|James|Sarah)\b/i.test(parsed)) {
-        // Search lines for clear "Name: <Proper Name>"
-        for (const line of lines || []) {
-          const t = String(line.text || '');
-          const m = t.match(/^\s*Name[:\s]+([A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,15})\b/i);
-          if (m && !/responsible|adult|incident|report|project/i.test(m[1])) {
+          const m = t.match(/^\s*(?:Name(?:\s*of\s*(?:the\s*)?person)?|Child\s*Name|Casualty|Patient)[:\s]+([A-Z][A-Za-z'-]{1,20}(?:\s+[A-Z][A-Za-z'-]{1,20}){1,3})\b/i);
+          if (m && !/responsible|adult|incident|report|project|completed|signature/i.test(m[1])) {
             parsed = parseName(m[1]) || m[1];
             raw = m[1];
             break;
-          }
-        }
-      }
-      if (parsed) {
-        const weak = /^[A-Za-z]{2,12}\s+[A-Za-z]{1,3}$/.test(parsed) || /^(Liam|Lisa)\s+Os$/i.test(parsed);
-        if (weak) {
-          let personLine = '';
-          for (const line of lines || []) {
-            if (/name of the person|ceng\b|^\s*name\b/i.test(line.text || '')) {
-              personLine = String(line.text || '');
-              break;
-            }
-          }
-          const fromLine = personLine.match(/\b((?:Lisa|Liam|Emma|James)\s+[A-Za-z']{2,20})\b/i);
-          if (fromLine && !/adult|responsible/i.test(fromLine[1])) {
-            parsed = parseName(fromLine[1]) || fromLine[1];
-            raw = fromLine[1];
-          } else if (/\bParker\b/i.test(personLine || joined) && /^(Liam|Lisa|Emma)\b/i.test(parsed)) {
-            parsed = parseName(`${parsed.split(/\s+/)[0]} Parker`) || parsed;
           }
         }
       }
@@ -2705,6 +2725,7 @@ function fieldsFromEyValuesChecks(values, checks, meta = {}, options = {}) {
     const value = checks[target.key] || 'false';
     const m = meta[target.key] || {};
     const conf = m.confidence || 0.7;
+    const boxBounds = m.bounds || (m.x !== undefined ? { x: m.x, y: m.y, width: m.width || 0.03, height: m.height || 0.015 } : { x: 0, y: 0, width: 0, height: 0, isFallback: true });
     fields.push({
       id: `field_${counter++}`,
       label: target.label,
@@ -2718,7 +2739,7 @@ function fieldsFromEyValuesChecks(values, checks, meta = {}, options = {}) {
       isUnreadable: false,
       isBlank: false,
       type: 'checkbox',
-      bounds: { x: 0.1, y: 0.3, width: 0.04, height: 0.015 },
+      bounds: boxBounds,
       isHandwritten: true,
       source: m.source || 'ey_label_absent',
       fieldKey: target.key
@@ -2776,26 +2797,347 @@ function buildEarlyYearsFormFields(lines, options = {}) {
 }
 
 /**
+ * Classify document type based on OCR content
+ */
+function classifyDocumentType(lines = [], fullText = '') {
+  const text = fullText || (lines || []).map(l => l.text || '').join('\n');
+  if (!text || text.length < 20) return 'generic_document';
+
+  // 1. Early Years Accident Report: Require high confidence and distinct markers
+  let eyScore = 0;
+  if (/Accident\s*&\s*Incident\s*Report/i.test(text)) eyScore += 4;
+  if (/ABOUT THIS FORM/i.test(text)) eyScore += 2;
+  if (/ABOUT THE PERSON/i.test(text)) eyScore += 2;
+  if (/ABOUT THE INCIDENT/i.test(text)) eyScore += 2;
+  if (/RIDDOR|DANGEROUS OCCURRENCE|REPORTABLE DISEASE/i.test(text)) eyScore += 2;
+  if (/SureStart|ToyBox|Daycare|EY\s*Staff/i.test(text)) eyScore += 2;
+  if (/TYPE OF INJURY|ABRASION|FRACTURE/i.test(text)) eyScore += 1;
+  if (/OUTCOME OF INCIDENT|RETURN TO ACTIVITIES/i.test(text)) eyScore += 1;
+
+  if (eyScore >= 6 && (/Accident\s*&\s*Incident/i.test(text) || /SureStart|ToyBox|Daycare/i.test(text))) {
+    return 'early_years_accident';
+  }
+
+  // 2. Invoice / Receipt
+  if (/TAX\s*INVOICE|INVOICE\s*(?:NO|NUMBER|#)|BILL\s*TO|BALANCE\s*DUE|SUBTOTAL|AMOUNT\s*DUE/i.test(text)) {
+    return 'invoice';
+  }
+  if (/RECEIPT|TOTAL\s*CASH|CHANGE\s*DUE|STORE\s*#|REGISTER\s*#/i.test(text)) {
+    return 'receipt';
+  }
+
+  // 3. Medical / Patient Intake
+  if (/PATIENT\s*(?:INTAKE|INFORMATION|NAME|HISTORY)|MEDICAL\s*(?:RECORD|HISTORY|EXAMINATION)|CLINIC|HOSPITAL|DIAGNOSIS|PHYSICIAN|PRESCRIPTION/i.test(text)) {
+    return 'medical_form';
+  }
+
+  // 4. Equipment Inspection
+  if (/EQUIPMENT\s*(?:INSPECTION|LOG|MAINTENANCE)|SAFETY\s*INSPECTION|INSPECTION\s*CHECKLIST|ASSET\s*TAG|SERIAL\s*NO/i.test(text)) {
+    return 'equipment_inspection';
+  }
+
+  // 5. Contract / Agreement
+  if (/AGREEMENT|CONTRACT|TERMS\s*AND\s*CONDITIONS|BETWEEN\s*THE\s*PARTIES|WITNESSETH|IN\s*WITNESS\s*WHEREOF/i.test(text)) {
+    return 'contract';
+  }
+
+  return 'generic_document';
+}
+
+/**
  * Detect whether uploaded OCR looks like the Early Years Accident & Incident form
  * (main FormFlow document type). Uncertain → dynamic.
  */
 function classifyAccidentFormLayout(lines = [], fullText = '') {
-  const text = fullText || (lines || []).map(l => l.text || '').join('\n');
-  if (!text || text.length < 40) return 'dynamic';
+  const docType = classifyDocumentType(lines, fullText);
+  return docType === 'early_years_accident' ? 'early_years_accident' : 'dynamic';
+}
 
-  let score = 0;
-  if (/Accident\s*&\s*Incident\s*Report/i.test(text)) score += 4; // main FormFlow document title
-  if (/ABOUT THIS FORM/i.test(text)) score += 2;
-  if (/ABOUT THE PERSON/i.test(text)) score += 2;
-  if (/ABOUT THE INCIDENT/i.test(text)) score += 2;
-  if (/RIDDOR|DANGEROUS OCCURRENCE|REPORTABLE DISEASE/i.test(text)) score += 2;
-  if (/TYPE OF INJURY|ABRASION|FRACTURE/i.test(text)) score += 1;
-  if (/OUTCOME OF INCIDENT|RETURN TO ACTIVITIES|FIRST AID APPLIED/i.test(text)) score += 1;
-  if (/SureStart|ToyBox|Daycare|EY\s*Staff|Non\s*EY/i.test(text)) score += 2;
-  if (/Ref\s*No|NAME OF THE PERSON|Responsible Adult|Name of the person/i.test(text)) score += 1;
+function isEarlyYearsAccident(payloadOrDoc) {
+  if (!payloadOrDoc) return false;
+  if (typeof payloadOrDoc === 'string') {
+    return payloadOrDoc === 'early_years_accident';
+  }
+  const type = payloadOrDoc.documentType || payloadOrDoc.formLayout;
+  return type === 'early_years_accident';
+}
 
-  // Title alone + any EY checkbox band is enough for main form layout
-  return score >= 4 ? 'early_years_accident' : 'dynamic';
+const EY_CHECKBOX_LABEL_MAP = {
+  staffEy: /\bey\s*staff\b/i,
+  staffNonEy: /\bnon\s*ey\s*staff\b/i,
+  staffVisitor: /\bvisitor\b/i,
+  staffParent: /\bparent\b/i,
+  childDaycare: /\bdaycare\b/i,
+  childToybox: /\btoy\s*box\b/i,
+  childSurestart: /\bsure\s*start\b/i,
+  typeAccident: /^(?:type\s+)?accident$/i,
+  typeIncident: /^(?:incident\s*type:\s*)?incident$/i,
+  typeNearMiss: /\bnear\s*miss\b/i,
+  severityRiddor: /^(?:severity(?::\s*|\s+))?riddor$/i,
+  severityModerate: /\bmoderate\b/i,
+  severityMinor: /\bminor\b/i,
+  riddorDangerous: /\bdangerous\s*occurrence\b/i,
+  riddorDisease: /\breportable\s*disease\b/i,
+  riddorPublic: /\binjury\s*to\s*public\b/i,
+  riddor3Days: /\binjury\s*3\s*days\b/i,
+  riddorMajor: /\bmajor\s*injury\b/i,
+  riddorDeath: /\bdeath\b/i,
+  causePeer: /\bcontact\s*with(?:\s*peer)?\b/i,
+  causeEquip: /\bequipment\b/i,
+  causeUnknown: /\bunknown\b/i,
+  causeSlip: /\bslip\s*\/?\s*trip\s*\/?\s*fall\b/i,
+  causeCoshh: /\bcoshh\b/i,
+  causeTraffic: /\btraffic\b/i,
+  causeManual: /\bmanual\s*handling\b/i,
+  causeChoking: /\bchoking\b/i,
+  causeVenue: /\bvenue\b/i,
+  injuryCut: /\babrasion\b|\bsmall\s*cut\b|\blight\s*bleed\b/i,
+  injuryBruise: /\bbruise\b|\bswelling\b|\bredness\b/i,
+  injuryStrain: /\bstrain\b|\bdislocation\b/i,
+  injuryFracture: /\bfracture\b|\bbroken\s*bone\b/i,
+  injuryHead: /\bhead\s*\/?\s*face\b/i,
+  injurySensory: /\bsensory\s*loss\b/i,
+  injuryConscious: /\bloss\s*of\s*consciousness\b/i,
+  injuryOrgan: /\borgan\s*injury\b|\bopen\s*wound\b/i,
+  injuryProperty: /\bproperty\s*damage\b/i,
+  injuryDistress: /\bemotional\s*distress\b/i,
+  outcomeReturn: /\breturn\s*to\s*activities\b/i,
+  outcomeFirstAid: /\bfirst\s*aid(?:\s*applied)?\b/i,
+  outcomeAdultCare: /\bto\s*responsible\s*adult\b|\bresponsible\s*adult\s*care\b/i,
+  outcomeNias: /\bnias\s*called\b/i,
+  outcomeHospital: /\bhospital\s*admittance\b/i,
+  outcomeSupport: /\bemotional\s*support\b/i
+};
+
+/**
+ * Resolve structured Early Years Accident Report fields & checkboxes from either
+ * keyed fields (`fieldKey`) or raw spatial key-value OCR fields (AWS Textract / Gemini / OpenAI).
+ */
+function extractEarlyYearsFormModel(fields = []) {
+  const list = Array.isArray(fields) ? fields : [];
+
+  const sortedByPos = (items) => [...items].sort((a, b) => {
+    const pDiff = (a.page || 1) - (b.page || 1);
+    if (pDiff !== 0) return pDiff;
+    const yDiff = (a.bounds?.y ?? 0.5) - (b.bounds?.y ?? 0.5);
+    if (Math.abs(yDiff) > 0.004) return yDiff;
+    return (a.bounds?.x ?? 0) - (b.bounds?.x ?? 0);
+  });
+
+  const nonBoolVal = (f) => {
+    if (!f || f.value === undefined || f.value === null) return '';
+    const v = String(f.value).trim();
+    if (!v || ['true', 'false'].includes(v.toLowerCase())) return '';
+    return v;
+  };
+
+  const getByKey = (key) => {
+    const f = list.find(item => item && item.fieldKey === key);
+    return nonBoolVal(f);
+  };
+
+  const getVal = (regex, fallback = '') => {
+    const hits = sortedByPos(list.filter(item => item && item.label && regex.test(item.label)));
+    for (const f of hits) {
+      const v = nonBoolVal(f);
+      if (v) return v;
+    }
+    return fallback;
+  };
+
+  const isCheckboxField = (item) => {
+    if (!item) return false;
+    if (item.type === 'checkbox') return true;
+    const v = String(item.value ?? '').toLowerCase().trim();
+    return ['true', 'false', 'yes', 'no', '1', '0', '[x]', 'checked', 'x'].includes(v);
+  };
+
+  const rawCheck = (keyOrRegex) => {
+    let f;
+    if (typeof keyOrRegex === 'string') {
+      f = list.find(item => item && item.fieldKey === keyOrRegex && isCheckboxField(item));
+      if (!f && EY_CHECKBOX_LABEL_MAP[keyOrRegex]) {
+        const rx = EY_CHECKBOX_LABEL_MAP[keyOrRegex];
+        f = list.find(item => item && item.label && rx.test(item.label.trim()) && isCheckboxField(item));
+      }
+    } else {
+      f = list.find(item => item && item.label && keyOrRegex.test(item.label.trim()) && isCheckboxField(item));
+    }
+    if (!f || f.value === undefined || f.value === null) return false;
+    return ['true', 'yes', '1', '[x]', 'checked', 'x'].includes(String(f.value).toLowerCase().trim());
+  };
+
+  // Spatial anchors for Completion & Sign-off section
+  const completedByField = list.find(f => f && f.label && /form\s*completed\s*by|^completed\s*by$/i.test(f.label.trim()));
+  const positionField = list.find(f => f && f.label && /^position$/i.test(f.label.trim()));
+  const parentBannerField = list.find(f => f && f.label && /parent\s*\/\s*guardian|parent.*guardian.*responsible\s*adult/i.test(f.label.trim()));
+  const commentsField = list.find(f => f && f.label && /^comments?$/i.test(f.label.trim()));
+
+  const anchorYs = [
+    completedByField?.bounds?.y,
+    positionField?.bounds?.y,
+    commentsField?.bounds?.y
+  ].filter(v => typeof v === 'number');
+  if (parentBannerField?.bounds?.y && parentBannerField.bounds.y > 0.65) {
+    anchorYs.push(parentBannerField.bounds.y - 0.04);
+  }
+  const signOffStartY = anchorYs.length > 0 ? Math.min(...anchorYs) - 0.02 : null;
+  const parentY = typeof parentBannerField?.bounds?.y === 'number'
+    ? parentBannerField.bounds.y
+    : (signOffStartY !== null ? signOffStartY + 0.04 : null);
+
+  // Disambiguate multiple DATE fields by spatial position
+  const dateFields = sortedByPos(
+    list.filter(f => f && f.label && /^date$|date/i.test(f.label.trim()) &&
+      !/d\.o\.b|birth|signed|parent|incident|form\s*date/i.test(f.label) &&
+      nonBoolVal(f))
+  );
+
+  const upperDates = dateFields.filter(f => signOffStartY === null || (f.bounds?.y ?? 0) < signOffStartY);
+  let headerDateFallback = '';
+  let incDateFallback = '';
+  for (const f of upperDates) {
+    const y = f.bounds?.y ?? 0;
+    if (y > 0 && y < 0.36 && !headerDateFallback) headerDateFallback = nonBoolVal(f);
+    else if (y >= 0.36 && !incDateFallback) incDateFallback = nonBoolVal(f);
+  }
+  if (!headerDateFallback && upperDates[0]) headerDateFallback = nonBoolVal(upperDates[0]);
+  if (!incDateFallback && upperDates[1]) incDateFallback = nonBoolVal(upperDates[1]);
+
+  let staffDateFallback = '';
+  let parentDateFallback = '';
+  if (signOffStartY !== null) {
+    const signOffDates = dateFields.filter(f => (f.bounds?.y ?? 0) >= signOffStartY);
+    if (typeof parentBannerField?.bounds?.y === 'number') {
+      const beforeParent = signOffDates.find(f => (f.bounds?.y ?? 0) < parentBannerField.bounds.y);
+      const afterParent = signOffDates.find(f => (f.bounds?.y ?? 0) >= parentBannerField.bounds.y);
+      if (beforeParent) staffDateFallback = nonBoolVal(beforeParent);
+      if (afterParent) parentDateFallback = nonBoolVal(afterParent);
+    } else {
+      if (signOffDates[0]) staffDateFallback = nonBoolVal(signOffDates[0]);
+      if (signOffDates[1]) parentDateFallback = nonBoolVal(signOffDates[1]);
+    }
+  }
+
+  // Disambiguate multiple TIME fields
+  const timeFields = sortedByPos(
+    list.filter(f => f && f.label && /^time$/i.test(f.label.trim()) && nonBoolVal(f))
+  );
+  let incTimeFallback = '';
+  let parentTimeFallback = '';
+  for (const f of timeFields) {
+    const y = f.bounds?.y ?? 0;
+    if (signOffStartY !== null) {
+      if (y < signOffStartY && !incTimeFallback) incTimeFallback = nonBoolVal(f);
+      else if (y >= signOffStartY && !parentTimeFallback) parentTimeFallback = nonBoolVal(f);
+    } else {
+      if (y < 0.72 && !incTimeFallback) incTimeFallback = nonBoolVal(f);
+      else if (y >= 0.72 && !parentTimeFallback) parentTimeFallback = nonBoolVal(f);
+    }
+  }
+
+  // Disambiguate multiple SIGNED fields (Staff signature vs Parent signature)
+  const signedFields = sortedByPos(
+    list.filter(f => f && f.label && /^signed$/i.test(f.label.trim()) && nonBoolVal(f))
+  );
+  let staffSignedFallback = '';
+  let parentSignedFallback = '';
+  if (typeof parentBannerField?.bounds?.y === 'number') {
+    const above = signedFields.find(f => (f.bounds?.y ?? 0) < parentBannerField.bounds.y);
+    const below = signedFields.find(f => (f.bounds?.y ?? 0) >= parentBannerField.bounds.y);
+    if (above) staffSignedFallback = nonBoolVal(above);
+    if (below) parentSignedFallback = nonBoolVal(below);
+  } else if (signedFields.length >= 2) {
+    staffSignedFallback = nonBoolVal(signedFields[0]);
+    parentSignedFallback = nonBoolVal(signedFields[1]);
+  } else if (signedFields.length === 1) {
+    const sf = signedFields[0];
+    if (completedByField?.bounds?.y && (sf.bounds?.y ?? 1) - completedByField.bounds.y <= 0.035) {
+      staffSignedFallback = nonBoolVal(sf);
+    } else if ((sf.bounds?.y ?? 0) >= 0.895) {
+      parentSignedFallback = nonBoolVal(sf);
+    } else {
+      staffSignedFallback = nonBoolVal(sf);
+    }
+  }
+
+  const refNo = getByKey('refNo') || getVal(/ref\s*no|reference/i, '');
+  let formDate = getByKey('formDate') || getVal(/^form\s*date$/i, headerDateFallback);
+  let project = getByKey('projectName') || getVal(/project\s*name/i, '');
+  const address = getByKey('bldgAddress') || getVal(/building\s*address/i, '');
+
+  // Disambiguate composite date + project name (e.g. "05-03-26 Riverside Nursery")
+  const dateProjectMatch = formDate.match(/^(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(.+)$/);
+  if (dateProjectMatch) {
+    formDate = dateProjectMatch[1].trim();
+    if (!project) project = dateProjectMatch[2].trim();
+  }
+
+  const name = getByKey('personName') || getVal(/name of the person|^name$/i, '');
+  const dob = getByKey('dob') || getVal(/d\.o\.b|date of birth/i, '');
+  const age = getByKey('age') || getVal(/^age$/i, '');
+  const regAddress = getByKey('regAddress') || getVal(/registered\s*address/i, '');
+  const postcode = getByKey('postcode') || getVal(/^postcode$/i, '');
+  const contact = getByKey('contactNumber') || getVal(/contact\s*number|phone|telephone/i, '');
+  const adult = getByKey('responsibleAdult') || getVal(/^responsible\s*adult$/i, '');
+  const session = getByKey('session') || getVal(/session\s*activity|^session$/i, '');
+
+  const incDate = getByKey('incidentDate') || getVal(/^incident\s*date$/i, incDateFallback);
+  const incTime = getByKey('incidentTime') || getVal(/^incident\s*time$/i, incTimeFallback);
+  const location = getByKey('location') || getVal(/space\s*\/\s*location|^space$/i, '');
+
+  const narrative = getByKey('narrative') || getVal(/narrative/i, '');
+  const completedBy = getByKey('completedBy') || getVal(/form\s*completed\s*by|^completed\s*by$/i, '');
+  const position = getByKey('position') || getVal(/^position$/i, '');
+  const signature = getByKey('signature') || getVal(/^staff\s*signature$|^signature$/i, staffSignedFallback);
+  const dateSigned = getByKey('dateSigned') || getVal(/^date\s*signed$/i, staffDateFallback);
+  const parentGuardianName = getByKey('parentGuardian') || nonBoolVal(parentBannerField);
+  const parentSigned = getByKey('parentSigned') || getVal(/^parent\s*signed$|^parent\s*signature$/i, parentSignedFallback) || parentGuardianName;
+  const parentDate = getByKey('parentDate') || getVal(/^parent.*date$/i, parentDateFallback);
+  const parentTime = getByKey('parentTime') || getVal(/^parent.*time$/i, parentTimeFallback);
+  const comments = getByKey('comments') || getVal(/^comments?$/i, '');
+
+  const isSeverityRiddor = rawCheck('severityRiddor');
+  const isChecked = (keyOrRegex) => {
+    if (typeof keyOrRegex === 'string' && keyOrRegex.startsWith('riddor')) {
+      return isSeverityRiddor && rawCheck(keyOrRegex);
+    }
+    return rawCheck(keyOrRegex);
+  };
+
+  return {
+    refNo,
+    formDate,
+    project,
+    address,
+    name,
+    dob,
+    age,
+    regAddress,
+    postcode,
+    contact,
+    adult,
+    session,
+    incDate,
+    incTime,
+    location,
+    narrative,
+    completedBy,
+    position,
+    signature,
+    dateSigned,
+    parentGuardianName,
+    parentSigned,
+    parentDate,
+    parentTime,
+    comments,
+    isRiddorApplicable: isSeverityRiddor,
+    isChecked,
+    checks: Object.keys(EY_CHECKBOX_LABEL_MAP).reduce((acc, k) => {
+      acc[k] = isChecked(k);
+      return acc;
+    }, {})
+  };
 }
 
 module.exports = {
@@ -2836,5 +3178,8 @@ module.exports = {
   sanitizeEyExtractedValues,
   applyEyFieldParsers,
   looksLikeAccidentVisionPayload,
-  classifyAccidentFormLayout
+  classifyAccidentFormLayout,
+  classifyDocumentType,
+  isEarlyYearsAccident,
+  extractEarlyYearsFormModel
 };
