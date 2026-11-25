@@ -205,36 +205,87 @@ async function getDocumentOr404(id, res) {
 // ----------------------------------------------------------------------------
 router.get('/status', (req, res) => {
   syncEnvFromFile();
+  setNoStoreHeaders(res);
+
+  const hasAws = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+  const hasAzure = !!(process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY && process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT);
+  const hasGemini = !!process.env.GEMINI_API_KEY;
+  const hasOpenai = !!process.env.OPENAI_API_KEY;
+
+  const activeProvider = hasAws
+    ? 'aws'
+    : hasAzure
+      ? 'azure'
+      : hasGemini
+        ? 'gemini'
+        : hasOpenai
+          ? 'openai'
+          : 'builtin';
+
+  const providers = {
+    aws: {
+      available: hasAws,
+      configured: hasAws,
+      activeInAuto: activeProvider === 'aws',
+      priority: 1,
+      type: 'Cloud ML OCR',
+      region: hasAws ? (process.env.AWS_REGION || 'us-east-1') : null,
+      envKeys: ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION'],
+      name: 'AWS Textract (Forms, Tables & Handwriting)'
+    },
+    azure: {
+      available: hasAzure,
+      configured: hasAzure,
+      activeInAuto: activeProvider === 'azure',
+      priority: 2,
+      type: 'Cloud ML OCR',
+      envKeys: ['AZURE_DOCUMENT_INTELLIGENCE_KEY', 'AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT'],
+      name: 'Azure AI Document Intelligence'
+    },
+    gemini: {
+      available: hasGemini,
+      configured: hasGemini,
+      activeInAuto: activeProvider === 'gemini',
+      priority: 3,
+      type: 'Cloud Vision LLM',
+      envKeys: ['GEMINI_API_KEY'],
+      name: 'Google Gemini 1.5 / 2.0 Vision LLM'
+    },
+    openai: {
+      available: hasOpenai,
+      configured: hasOpenai,
+      activeInAuto: activeProvider === 'openai',
+      priority: 4,
+      type: 'Cloud Vision LLM',
+      envKeys: ['OPENAI_API_KEY'],
+      name: 'OpenAI GPT-4o Vision'
+    },
+    builtin: {
+      available: true,
+      configured: true,
+      readyWithoutKey: true,
+      activeInAuto: activeProvider === 'builtin',
+      priority: 5,
+      type: 'Local Offline OCR',
+      envKeys: [],
+      name: 'FormFlow Smart Local Engine (Sharp + Tesseract + CV)'
+    }
+  };
+
   res.json({
     status: 'online',
     version: '1.0.0',
-    providers: {
-      builtin: {
-        available: true,
-        name: 'FormFlow Smart Local Engine (Sharp + Tesseract + CV)',
-        readyWithoutKey: true
-      },
-      aws: {
-        available: !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY),
-        name: 'AWS Textract (Forms, Tables & Handwriting)',
-        configured: !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
-      },
-      azure: {
-        available: !!(process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY && process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT),
-        name: 'Azure AI Document Intelligence',
-        configured: !!(process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY && process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT)
-      },
-      gemini: {
-        available: !!process.env.GEMINI_API_KEY,
-        name: 'Google Gemini 1.5 / 2.0 Vision LLM',
-        configured: !!process.env.GEMINI_API_KEY
-      },
-      openai: {
-        available: !!process.env.OPENAI_API_KEY,
-        name: 'OpenAI GPT-4o Vision',
-        configured: !!process.env.OPENAI_API_KEY
-      }
-    }
+    environment: process.env.NODE_ENV || 'development',
+    activeProvider,
+    activeEngineName: providers[activeProvider].name,
+    security: {
+      storageMode: 'ephemeral_memory_only',
+      diskUploadStorage: false,
+      diskProcessedStorage: false,
+      documentTtlMinutes: Math.round(getDocumentTtlMs() / 60000),
+      activeSessionsCount: documentsMap.size
+    },
+    providers
   });
 });
 

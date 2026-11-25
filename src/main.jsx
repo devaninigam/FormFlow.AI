@@ -1,7 +1,36 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import ReactDOM from 'react-dom/client';
 import DocumentConverter from './DocumentConverter';
+import ConfigPage from './ConfigPage';
 import './index.css';
+
+function isConfigPath(pathname) {
+  return /^\/config\/?$/i.test(pathname || '');
+}
+
+function AppRouter() {
+  const [pathname, setPathname] = useState(() => window.location.pathname || '/');
+
+  useEffect(() => {
+    const onPopState = () => setPathname(window.location.pathname || '/');
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  const navigate = (to) => {
+    const target = to || '/';
+    if (window.location.pathname !== target) {
+      window.history.pushState({}, '', target);
+    }
+    setPathname(target);
+  };
+
+  if (isConfigPath(pathname)) {
+    return <ConfigPage onNavigate={navigate} />;
+  }
+
+  return <DocumentConverter />;
+}
 
 class GlobalErrorBoundary extends React.Component {
   constructor(props) {
@@ -66,7 +95,7 @@ class GlobalErrorBoundary extends React.Component {
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <GlobalErrorBoundary>
-      <DocumentConverter />
+      <AppRouter />
     </GlobalErrorBoundary>
   </React.StrictMode>
 );
